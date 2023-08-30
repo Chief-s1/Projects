@@ -1,0 +1,133 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+*{
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Poppins', sans-serif;
+}
+body{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 50vh;
+  padding: 0 10px;
+  background: #25d11f;
+}
+::selection{
+  color: #fff;
+  background: #55d50b;
+}
+.wrapper{
+  width: 4500px;
+  padding: 30px;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 7px 7px 20px rgba(0, 0, 0, 0.05);
+}
+.wrapper header{
+  font-size: 28px;
+  font-weight: 500;
+  text-align: center;
+}
+.wrapper form{  
+  margin: 40px 0 20px 0;
+}
+form :where(input, select, button){
+  width: 100%;
+  outline: none;
+  border-radius: 50px;
+  border: none;
+}
+form p{
+  font-size: 18px;
+  margin-bottom: 5px;
+}
+form input{
+  height: 50px;
+  font-size: 17px;
+text-align: center;
+  border: 5px solid #b4d04f;
+}
+form input:focus{
+  padding: 0 50px;
+  border:   5px solid #c4ef27;
+}
+form .drop-list{
+  display: flex;
+  margin-top: 20px;
+  align-items: center;
+  justify-content: space-between;
+}
+.drop-list .select-box{
+  display: flex;
+  width: 300px;
+  height: 55px;
+  align-items: center;
+  border-radius: 5px;
+  justify-content: center;
+  border: 2px solid #b4d04f;
+}
+.select-box select{
+  text-align: center;
+  width: 150px;
+  font-size: 20px;
+  background: none;
+  margin: 0 -5px 0 5px;
+}
+.select-box select::-webkit-scrollbar{
+  text-align: center;
+  width: 10px;
+}
+.select-box select::-webkit-scrollbar-track{
+  background: #fff;
+}
+.select-box select::-webkit-scrollbar-thumb{
+  background: #888;
+  border-radius: 8px;
+  border-right: 2px solid #ffffff;
+}
+.drop-list .icon{
+  cursor: pointer;
+  margin-top: 30px;
+  font-size: 22px;
+}
+form .exchange-rate{
+  text-align: center;
+  font-size: 25px;
+  margin: 20px 0 30px;
+}
+
+form button{
+  height: 52px;
+  color: #fff;
+  font-size: 17px;
+  cursor: pointer;
+  background: #f01616;
+  transition: 0.3s ease;
+}
+
+form button:hover{
+  background: #000000;
+}
+footer {
+  clear: both;
+  border: 1px groove #aaaaaa;
+  background: rgb(178, 178, 202);
+  color: rgb(255, 255, 255);
+  padding: 0;
+  font-size: 20px;
+  text-align: center;
+  vertical-align: middle;
+  line-height: 50px;
+  margin: 0;
+  position: fixed;
+  bottom: 100px;
+  width: 100%;
+  transition: 0.5s ease;
+}
+
+footer:hover{
+
+  background: #f01616;
+}
