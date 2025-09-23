@@ -1,0 +1,226 @@
+project/
+│── excel_parser/
+│   │── __init__.py
+│   │── scanner.py         # scan directory & find Excel files
+│   │── parser.py          # parse Excel sheets & normalize columns
+│   │── utils.py           # common helpers (logging, regex patterns, etc.)
+│   │── exporter.py        # save master Excel
+│── scripts/
+│   │── run_parser.py      # CLI entry point for parsing
+│   │── push_to_db.py      # separate script for DB push
+
+------------------------------------------------------------------------------------------------------------------------
+excel_parser/utils.py
+1
+import re
+import logging
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Regex pattern for result filenames
+RESULT_FILE_PATTERN = re.compile(r".*(final).*?(result).*", re.IGNORECASE)
+
+# Relevant columns we care about
+RELEVANT_COLUMNS = [
+    "result", "results",
+    "observability",
+    "api used", "api_used",
+    "dynatrace link", "dynatrace_link",
+    "sla breached", "sla_breached"
+]
+
+def is_result_file(filename: str) -> bool:
+    return bool(RESULT_FILE_PATTERN.match(filename))
+
+------------------------------------------------------------------------------------------------------------------------
+2. excel_parser/parser.py
+
+import pandas as pd
+import logging
+from .utils import RELEVANT_COLUMNS
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize dataframe columns to lowercase with underscores."""
+    col_map = {}
+    for col in df.columns:
+        normalized = col.strip().lower().replace(" ", "_")
+        col_map[col] = normalized
+    return df.rename(columns=col_map)
+
+def extract_relevant_data(file_path: str) -> list:
+    """Extract relevant rows from all sheets in the Excel file."""
+    extracted_data = []
+    try:
+        xl = pd.ExcelFile(file_path)
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet)
+            df = normalize_columns(df)
+
+            relevant_cols = [
+                c for c in df.columns 
+                if c in [col.replace(" ", "_") for col in RELEVANT_COLUMNS]
+            ]
+            if not relevant_cols:
+                continue
+
+            for idx, row in df.iterrows():
+                record = {"file_path": file_path, "sheet_name": sheet, "row_index": idx}
+                for col in relevant_cols:
+                    record[col] = row.get(col, None)
+                extracted_data.append(record)
+    except Exception as e:
+        logging.error(f"Failed to parse {file_path}: {e}")
+    return extracted_data
+
+------------------------------------------------------------------------------------------------------------------------
+3.excel_parser/scanner.py
+import os
+import logging
+import pandas as pd
+from .parser import extract_relevant_data
+from .utils import is_result_file
+
+def scan_and_parse(root_dir: str) -> pd.DataFrame:
+    """Scan directories recursively and parse result Excel files."""
+    all_data = []
+    for subdir, _, files in os.walk(root_dir):
+        for f in files:
+            if f.lower().endswith((".xlsx", ".xls")) and is_result_file(f):
+                file_path = os.path.join(subdir, f)
+                logging.info(f"Parsing file: {file_path}")
+                all_data.extend(extract_relevant_data(file_path))
+    return pd.DataFrame(all_data)
+
+------------------------------------------------------------------------------------------------------------------------
+4. excel_parser/exporter.py
+import logging
+
+def save_master_excel(df, output_path: str):
+    """Save parsed results into a master Excel file."""
+    if df.empty:
+        logging.warning("No relevant data found, master file not created.")
+        return
+    df.to_excel(output_path, index=False)
+    logging.info(f"Master Excel created: {output_path}")
+
+------------------------------------------------------------------------------------------------------------------------
+5. scripts/run_parser.py (Main parser CLI)
+import argparse
+from excel_parser.scanner import scan_and_parse
+from excel_parser.exporter import save_master_excel
+
+def cli():
+    parser = argparse.ArgumentParser(description="Excel Parser for Result Files")
+    parser.add_argument("root", help="Root directory containing result files")
+    parser.add_argument("--master", default="master.xlsx", help="Output master Excel path")
+    args = parser.parse_args()
+
+    df = scan_and_parse(args.root)
+    save_master_excel(df, args.master)
+
+if __name__ == "__main__":
+    cli()
+
+------------------------------------------------------------------------------------------------------------------------
+6. excel_parser/db 
+"""
+Push Master Excel into SQLite DB
+
+Usage:
+    python push_master_to_db.py master.xlsx --db results.db --table results --overwrite
+
+Dependencies:
+    pandas, sqlite3
+"""
+
+import argparse
+import pandas as pd
+import sqlite3
+import logging
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+
+def ensure_table(conn, table_name: str):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT,
+            sheet_name TEXT,
+            row_index INTEGER,
+            result TEXT,
+            observability TEXT,
+            api_used TEXT,
+            dynatrace_link TEXT,
+            sla_breached INTEGER,
+            extra JSON
+        );
+    """)
+    conn.commit()
+
+
+def push_master_to_db(master_path: str, db_path: str, table_name: str, overwrite: bool = False):
+    logging.info(f"Loading master Excel: {master_path}")
+    df = pd.read_excel(master_path, dtype=object)
+
+    conn = sqlite3.connect(db_path)
+    if overwrite:
+        logging.info(f"Overwrite enabled: dropping table {table_name}")
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    ensure_table(conn, table_name)
+
+    records = df.to_dict(orient="records")
+    conn.executemany(f"""
+        INSERT INTO {table_name} 
+        (file_path, sheet_name, row_index, result, observability, api_used, dynatrace_link, sla_breached, extra)
+        VALUES (:file_path, :sheet_name, :row_index, :result, :observability, :api_used, :dynatrace_link, :sla_breached, :extra)
+    """, records)
+    conn.commit()
+    conn.close()
+
+    logging.info(f"Inserted {len(records)} rows into {table_name}")
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="Push Master Excel into SQLite DB")
+    parser.add_argument("master", help="Path to master Excel file")
+    parser.add_argument("--db", default="results.db", help="SQLite database path (default: results.db)")
+    parser.add_argument("--table", default="results", help="Table name (default: results)")
+    parser.add_argument("--overwrite", action="store_true", help="Drop table if exists and recreate")
+    args = parser.parse_args()
+
+    push_master_to_db(args.master, args.db, args.table, args.overwrite)
+
+
+if __name__ == "__main__":
+    cli()
+
+------------------------------------------------------------------------------------------------------------------------
+excel_parser/__main__.py
+
+import argparse
+from .scanner import scan_and_parse
+from .exporter import save_master_excel
+
+def main():
+    parser = argparse.ArgumentParser(description="Excel Parser CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Subcommand: scan
+    scan_parser = subparsers.add_parser("scan", help="Scan directory and create master Excel")
+    scan_parser.add_argument("root", help="Root directory containing result files")
+    scan_parser.add_argument("--master", default="master.xlsx", help="Output master Excel path")
+
+    args = parser.parse_args()
+
+    if args.command == "scan":
+        df = scan_and_parse(args.root)
+        save_master_excel(df, args.master)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+
+------------------------------------------------------------------------------------------------------------------------

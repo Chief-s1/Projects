@@ -1,0 +1,493 @@
+"""
+Automated Excel -> Master Excel -> SQLite pipeline script.
+
+This version is non-interactive:
+ - Scans a configured folder (recursively) for result Excel files
+ - Creates/overwrites a master Excel
+ - Loads data into SQLite
+ - No CLI required (ready for CI/CD + Streamlit button integration)
+
+Configuration via environment variables:
+    RESULTS_FOLDER  : Root folder to scan (default: ./results)
+    MASTER_FILE     : Path to master Excel (default: ./master.xlsx)
+    SQLITE_DB       : SQLite database path (default: ./results.db)
+    SQLITE_TABLE    : SQLite table name (default: results)
+    OVERWRITE_TABLE : "true"/"false" to drop & recreate table (default: true)
+"""
+
+import os
+import sqlite3
+import pandas as pd
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+COLUMN_KEYWORDS = {
+    'result': ['result', 'results', 'status', 'test result'],
+    'observability': ['observability', 'observable', 'obs', 'observation'],
+    'api_used': ['api used', 'api', 'endpoint', 'endpoint called'],
+    'dynatrace_link': ['dynatrace', 'dynatrace link', 'dynatrace_url', 'link', 'monitoring link'],
+    'sla_breached': ['sla', 'sla breached', 'sla_breached', 'breach', 'sla status']
+}
+
+
+def normalize_col(col: str) -> str:
+    return str(col).strip().lower()
+
+
+def map_columns(columns):
+    norm_to_orig = {normalize_col(c): c for c in columns}
+    mapping = {k: None for k in COLUMN_KEYWORDS}
+    for field, keywords in COLUMN_KEYWORDS.items():
+        for k in keywords:
+            if k in norm_to_orig:
+                mapping[field] = norm_to_orig[k]
+                break
+        if mapping[field]:
+            continue
+        for norm, orig in norm_to_orig.items():
+            if any(kw in norm for kw in keywords):
+                mapping[field] = orig
+                break
+    return mapping
+
+
+def parse_sla_value(val):
+    if pd.isna(val):
+        return None
+    if isinstance(val, bool):
+        return 1 if val else 0
+    s = str(val).strip().lower()
+    if s in ('yes', 'y', 'true', 't', '1'):
+        return 1
+    if s in ('no', 'n', 'false', 'f', '0'):
+        return 0
+    try:
+        return 1 if float(s) != 0 else 0
+    except Exception:
+        return None
+
+
+def row_to_record(file_path, sheet_name, row_idx, row, mapping):
+    def get_mapped(field):
+        col = mapping.get(field)
+        return row[col] if (col in row.index and pd.notna(row[col])) else None
+
+    record = {
+        'file_path': file_path,
+        'sheet_name': sheet_name,
+        'row_index': int(row_idx),
+        'result': str(get_mapped('result')) if get_mapped('result') else None,
+        'observability': str(get_mapped('observability')) if get_mapped('observability') else None,
+        'api_used': str(get_mapped('api_used')) if get_mapped('api_used') else None,
+        'dynatrace_link': str(get_mapped('dynatrace_link')) if get_mapped('dynatrace_link') else None,
+        'sla_breached': parse_sla_value(get_mapped('sla_breached')),
+        'extra': None
+    }
+
+    mapped_cols = set(v for v in mapping.values() if v)
+    extra = {}
+    for col in row.index:
+        if col in mapped_cols:
+            continue
+        val = row[col]
+        if pd.isna(val):
+            continue
+        try:
+            json.dumps(val)
+            extra[col] = val
+        except TypeError:
+            extra[col] = str(val)
+    record['extra'] = json.dumps(extra) if extra else None
+    return record
+
+
+def scan_excel_files(root_folder):
+    candidates = []
+    for dirpath, _, filenames in os.walk(root_folder):
+        for fn in filenames:
+            name = fn.lower()
+            if 'final' in name and 'result' in name and fn.endswith((".xlsx", ".xls", ".xlsm")):
+                candidates.append(os.path.join(dirpath, fn))
+    logging.info(f"Found {len(candidates)} result files under {root_folder}")
+    return candidates
+
+
+def create_master_excel(file_list, output_path):
+    all_records = []
+    for file in file_list:
+        try:
+            xls = pd.read_excel(file, sheet_name=None, dtype=object)
+        except Exception as e:
+            logging.warning(f"Skipping {file}: {e}")
+            continue
+
+        for sheet_name, df in xls.items():
+            if df.empty:
+                continue
+            mapping = map_columns(df.columns)
+            for idx, row in df.iterrows():
+                record = row_to_record(file, sheet_name, idx, row, mapping)
+                all_records.append(record)
+
+    if not all_records:
+        logging.warning("No data found in any files")
+        return
+
+    master_df = pd.DataFrame(all_records)
+    master_df.to_excel(output_path, index=False)
+    logging.info(f"Master Excel created: {output_path} with {len(master_df)} rows")
+    return master_df
+
+
+def ensure_table(conn, table_name):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT,
+            sheet_name TEXT,
+            row_index INTEGER,
+            result TEXT,
+            observability TEXT,
+            api_used TEXT,
+            dynatrace_link TEXT,
+            sla_breached INTEGER,
+            extra JSON
+        );
+    """)
+    conn.commit()
+
+
+def load_master_to_sqlite(master_df, db_path, table_name, overwrite=True):
+    conn = sqlite3.connect(db_path)
+    if overwrite:
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    ensure_table(conn, table_name)
+    records = master_df.to_dict(orient='records')
+    conn.executemany(f"""
+        INSERT INTO {table_name} (file_path, sheet_name, row_index, result, observability, api_used, dynatrace_link, sla_breached, extra)
+        VALUES (:file_path, :sheet_name, :row_index, :result, :observability, :api_used, :dynatrace_link, :sla_breached, :extra)
+    """, records)
+    conn.commit()
+    conn.close()
+    logging.info(f"Inserted {len(records)} rows into {table_name}")
+
+
+def main():
+    results_folder = os.getenv("RESULTS_FOLDER", "./results")
+    master_file = os.getenv("MASTER_FILE", "./master.xlsx")
+    sqlite_db = os.getenv("SQLITE_DB", "./results.db")
+    sqlite_table = os.getenv("SQLITE_TABLE", "results")
+    overwrite = os.getenv("OVERWRITE_TABLE", "true").lower() == "true"
+
+    files = scan_excel_files(results_folder)
+    master_df = create_master_excel(files, master_file)
+    if master_df is not None:
+        load_master_to_sqlite(master_df, sqlite_db, sqlite_table, overwrite)
+
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------------------------------------------------------------------------------------------
+interactable
+--------------------------------------------------------------------------------------------------------------------------------------
+"""
+Excel -> SQLite + Master Excel Generator
+
+Enhancements:
+ - Recursively scans a folder for Excel files in subfolders
+ - Picks files whose names contain both "final" and "result" (case-insensitive, flexible separators)
+ - Parses all matching Excel files, extracts relevant data, and writes a master Excel file consolidating everything
+ - Provides a second function to store the master Excel into SQLite
+
+Dependencies:
+    pandas, openpyxl, sqlite3
+
+Usage:
+    python excel_to_sqlite_parser.py scan ./results_folder --master master.xlsx
+    python excel_to_sqlite_parser.py load master.xlsx --db results.db --table results --overwrite
+
+"""
+
+import argparse
+import sqlite3
+import pandas as pd
+import json
+import os
+import logging
+from typing import Dict, Any, Tuple, List
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Keywords to search for when mapping columns
+COLUMN_KEYWORDS = {
+    'result': ['result', 'results', 'status', 'test result'],
+    'observability': ['observability', 'observable', 'obs', 'observation'],
+    'api_used': ['api used', 'api', 'endpoint', 'endpoint called'],
+    'dynatrace_link': ['dynatrace', 'dynatrace link', 'dynatrace_url', 'link', 'monitoring link'],
+    'sla_breached': ['sla', 'sla breached', 'sla_breached', 'breach', 'sla status']
+}
+
+
+def normalize_col(col: str) -> str:
+    return str(col).strip().lower()
+
+
+def map_columns(columns) -> Dict[str, str]:
+    norm_to_orig = {normalize_col(c): c for c in columns}
+    mapping = {k: None for k in COLUMN_KEYWORDS}
+
+    for field, keywords in COLUMN_KEYWORDS.items():
+        for k in keywords:
+            if k in norm_to_orig:
+                mapping[field] = norm_to_orig[k]
+                break
+        if mapping[field] is not None:
+            continue
+        for norm, orig in norm_to_orig.items():
+            for kw in keywords:
+                if kw in norm:
+                    mapping[field] = orig
+                    break
+            if mapping[field] is not None:
+                break
+    return mapping
+
+
+def parse_sla_value(val) -> int:
+    if pd.isna(val):
+        return None
+    if isinstance(val, bool):
+        return 1 if val else 0
+    s = str(val).strip().lower()
+    if s == '':
+        return None
+    if s in ('yes', 'y', 'true', 't', '1'):
+        return 1
+    if s in ('no', 'n', 'false', 'f', '0'):
+        return 0
+    try:
+        n = float(s)
+        return 1 if n != 0 else 0
+    except Exception:
+        return None
+
+
+def row_to_record(file_path: str, sheet_name: str, row_idx: int, row: pd.Series, mapping: Dict[str, str]):
+    def get_mapped(field):
+        col = mapping.get(field)
+        return row[col] if (col in row.index and pd.notna(row[col])) else None
+
+    result = get_mapped('result')
+    observability = get_mapped('observability')
+    api_used = get_mapped('api_used')
+    dynatrace_link = get_mapped('dynatrace_link')
+    sla_breached = parse_sla_value(get_mapped('sla_breached'))
+
+    mapped_cols = set(v for v in mapping.values() if v is not None)
+    extra = {}
+    for col in row.index:
+        if col in mapped_cols:
+            continue
+        val = row[col]
+        if pd.isna(val):
+            continue
+        try:
+            json.dumps(val)
+            extra[col] = val
+        except TypeError:
+            extra[col] = str(val)
+
+    extra_json = json.dumps(extra, default=str) if extra else None
+
+    return {
+        'file_path': file_path,
+        'sheet_name': sheet_name,
+        'row_index': int(row_idx),
+        'result': None if pd.isna(result) else str(result),
+        'observability': None if pd.isna(observability) else str(observability),
+        'api_used': None if pd.isna(api_used) else str(api_used),
+        'dynatrace_link': None if pd.isna(dynatrace_link) else str(dynatrace_link),
+        'sla_breached': sla_breached,
+        'extra': extra_json
+    }
+
+
+def scan_excel_files(root_folder: str) -> List[str]:
+    candidates = []
+    for dirpath, _, filenames in os.walk(root_folder):
+        for fn in filenames:
+            name = fn.lower()
+            if 'final' in name and 'result' in name and fn.endswith((".xlsx", ".xls", ".xlsm")):
+                candidates.append(os.path.join(dirpath, fn))
+    logging.info(f"Found {len(candidates)} result files under {root_folder}")
+    return candidates
+
+
+def create_master_excel(file_list: List[str], output_path: str):
+    all_records = []
+    for file in file_list:
+        try:
+            xls = pd.read_excel(file, sheet_name=None, dtype=object)
+        except Exception as e:
+            logging.warning(f"Skipping {file}: {e}")
+            continue
+
+        for sheet_name, df in xls.items():
+            if df.empty:
+                continue
+            mapping = map_columns(df.columns)
+            for idx, row in df.iterrows():
+                record = row_to_record(file, sheet_name, idx, row, mapping)
+                all_records.append(record)
+
+    if not all_records:
+        logging.warning("No data found in any files")
+        return
+
+    master_df = pd.DataFrame(all_records)
+    master_df.to_excel(output_path, index=False)
+    logging.info(f"Master Excel created: {output_path} with {len(master_df)} rows")
+
+
+def ensure_table(conn: sqlite3.Connection, table_name: str):
+    cur = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT,
+            sheet_name TEXT,
+            row_index INTEGER,
+            result TEXT,
+            observability TEXT,
+            api_used TEXT,
+            dynatrace_link TEXT,
+            sla_breached INTEGER,
+            extra JSON
+        );
+    """)
+    conn.commit()
+
+
+def load_master_to_sqlite(master_path: str, db_path: str, table_name: str, overwrite: bool = False):
+    df = pd.read_excel(master_path, dtype=object)
+    conn = sqlite3.connect(db_path)
+    if overwrite:
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    ensure_table(conn, table_name)
+    records = df.to_dict(orient='records')
+    cur = conn.cursor()
+    cur.executemany(f"""
+        INSERT INTO {table_name} (file_path, sheet_name, row_index, result, observability, api_used, dynatrace_link, sla_breached, extra)
+        VALUES (:file_path, :sheet_name, :row_index, :result, :observability, :api_used, :dynatrace_link, :sla_breached, :extra)
+    """, records)
+    conn.commit()
+    conn.close()
+    logging.info(f"Inserted {len(records)} rows into {table_name} from {master_path}")
+
+
+def cli():
+    p = argparse.ArgumentParser(description='Scan Excel result files and consolidate into master Excel, or load into SQLite')
+    sub = p.add_subparsers(dest='cmd')
+
+    scan_p = sub.add_parser('scan', help='Scan folder for result files and create master Excel')
+    scan_p.add_argument('folder', help='Root folder to scan')
+    scan_p.add_argument('--master', default='master.xlsx', help='Output master Excel path')
+
+    load_p = sub.add_parser('load', help='Load master Excel into SQLite DB')
+    load_p.add_argument('master', help='Master Excel path')
+    load_p.add_argument('--db', default='results.db', help='SQLite DB path')
+    load_p.add_argument('--table', default='results', help='SQLite table name')
+    load_p.add_argument('--overwrite', action='store_true', help='Overwrite existing table')
+
+    args = p.parse_args()
+
+    if args.cmd == 'scan':
+        files = scan_excel_files(args.folder)
+        create_master_excel(files, args.master)
+    elif args.cmd == 'load':
+        load_master_to_sqlite(args.master, args.db, args.table, args.overwrite)
+    else:
+        p.print_help()
+
+
+if __name__ == '__main__':
+    cli()
+
+--------------------------------------------------------------------------------------------------------------------------------------
+db
+--------------------------------------------------------------------------------------------------------------------------------------
+"""
+Push Master Excel into SQLite DB
+
+Usage:
+    python push_master_to_db.py master.xlsx --db results.db --table results --overwrite
+
+Dependencies:
+    pandas, sqlite3
+"""
+
+import argparse
+import pandas as pd
+import sqlite3
+import logging
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+
+def ensure_table(conn, table_name: str):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT,
+            sheet_name TEXT,
+            row_index INTEGER,
+            result TEXT,
+            observability TEXT,
+            api_used TEXT,
+            dynatrace_link TEXT,
+            sla_breached INTEGER,
+            extra JSON
+        );
+    """)
+    conn.commit()
+
+
+def push_master_to_db(master_path: str, db_path: str, table_name: str, overwrite: bool = False):
+    logging.info(f"Loading master Excel: {master_path}")
+    df = pd.read_excel(master_path, dtype=object)
+
+    conn = sqlite3.connect(db_path)
+    if overwrite:
+        logging.info(f"Overwrite enabled: dropping table {table_name}")
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    ensure_table(conn, table_name)
+
+    records = df.to_dict(orient="records")
+    conn.executemany(f"""
+        INSERT INTO {table_name} 
+        (file_path, sheet_name, row_index, result, observability, api_used, dynatrace_link, sla_breached, extra)
+        VALUES (:file_path, :sheet_name, :row_index, :result, :observability, :api_used, :dynatrace_link, :sla_breached, :extra)
+    """, records)
+    conn.commit()
+    conn.close()
+
+    logging.info(f"Inserted {len(records)} rows into {table_name}")
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="Push Master Excel into SQLite DB")
+    parser.add_argument("master", help="Path to master Excel file")
+    parser.add_argument("--db", default="results.db", help="SQLite database path (default: results.db)")
+    parser.add_argument("--table", default="results", help="Table name (default: results)")
+    parser.add_argument("--overwrite", action="store_true", help="Drop table if exists and recreate")
+    args = parser.parse_args()
+
+    push_master_to_db(args.master, args.db, args.table, args.overwrite)
+
+
+if __name__ == "__main__":
+    cli()
