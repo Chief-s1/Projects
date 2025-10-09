@@ -2,9 +2,9 @@ import os
 import re
 import pandas as pd
 import logging
-from sqlalchemy import create_engine, MetaData, Table, Column, String, CLOB
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, MetaData, Table, Column, String
 from sqlalchemy.dialects.oracle import CLOB as OracleCLOB
+from sqlalchemy.exc import SQLAlchemyError
 from logging.handlers import RotatingFileHandler
 
 # ======================================================
@@ -12,11 +12,13 @@ from logging.handlers import RotatingFileHandler
 # ======================================================
 USERNAME = "your_username"
 PASSWORD = "your_password"
-DNS = "hostname:1521/servicename"  # example: "10.12.45.20:1521/ORCLPDB1"
+HOST = "your_hostname"          # e.g. 10.20.30.40
+PORT = "1521"
+SERVICE_NAME = "orclpdb1"       # example service name
 
-ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"  # base directory
+ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"  # base folder
 MAX_COLS = 40
-STORY_REGEX = r"US\d+"  # user story ID pattern
+STORY_REGEX = r"US\d+"          # user story pattern (case-insensitive)
 
 # ======================================================
 # LOGGING CONFIGURATION
@@ -29,14 +31,14 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # ======================================================
-# DATABASE INITIALIZATION
+# DATABASE CONNECTION (USING oracledb)
 # ======================================================
-DB_URL = f"oracle+cx_oracle://{USERNAME}:{PASSWORD}@{DNS}"
+DB_URL = f"oracle+oracledb://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/?service_name={SERVICE_NAME}"
 
 engine = create_engine(DB_URL)
 metadata = MetaData()
 
-# Define a table with 40 CLOB columns
+# Define story_data table (40 CLOB columns)
 columns = [Column("story_id", String(50), primary_key=True)]
 for i in range(1, MAX_COLS + 1):
     columns.append(Column(f"col{i}", OracleCLOB))
@@ -47,7 +49,9 @@ metadata.create_all(engine, checkfirst=True)
 # ======================================================
 # HELPER FUNCTIONS
 # ======================================================
+
 def find_excel_files(root):
+    """Recursively find all Excel files"""
     excel_files = []
     for dirpath, _, filenames in os.walk(root):
         for f in filenames:
@@ -55,19 +59,22 @@ def find_excel_files(root):
                 excel_files.append(os.path.join(dirpath, f))
     return excel_files
 
+
 def extract_story_id(df):
-    # Search for US pattern in entire DataFrame
+    """Find USxxxxx pattern anywhere in the Excel content"""
     try:
         text_data = df.astype(str).values.ravel()
-        matches = [re.search(STORY_REGEX, str(val), re.IGNORECASE) for val in text_data]
-        matches = [m.group(0).upper() for m in matches if m]
-        if matches:
-            return matches[0]
+        for val in text_data:
+            match = re.search(STORY_REGEX, str(val), re.IGNORECASE)
+            if match:
+                return match.group(0).upper()
     except Exception as e:
-        logger.error(f"Error while scanning for story ID: {e}")
+        logger.error(f"Error extracting story ID: {e}")
     return None
 
+
 def flatten_excel_data(df):
+    """Flatten all cell values into a single list of strings (max 40)"""
     values = df.astype(str).values.flatten().tolist()
     if len(values) > MAX_COLS:
         logger.warning(f"Truncating {len(values)} values to {MAX_COLS}")
@@ -76,16 +83,18 @@ def flatten_excel_data(df):
         values += [None] * (MAX_COLS - len(values))
     return values
 
+
 def ingest_file(file_path, conn):
+    """Process a single Excel file and insert into DB"""
     try:
-        df = pd.read_excel(file_path)
+        df = pd.read_excel(file_path, engine="openpyxl")
         if df.empty:
             logger.warning(f"Skipped empty file: {file_path}")
             return
 
         story_id = extract_story_id(df)
         if not story_id:
-            logger.warning(f"No Story ID found in file: {file_path}")
+            logger.warning(f"No story ID found in: {file_path}")
             return
 
         values = flatten_excel_data(df)
@@ -95,22 +104,28 @@ def ingest_file(file_path, conn):
 
         with conn.begin():
             conn.execute(story_data.insert().values(**row))
+
         logger.info(f"✅ Inserted story {story_id} from {os.path.basename(file_path)}")
 
     except SQLAlchemyError as e:
-        logger.error(f"Database error for file {file_path}: {e}", exc_info=True)
+        logger.error(f"DB error while inserting {file_path}: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
+        logger.error(f"Error processing {file_path}: {e}", exc_info=True)
 
 # ======================================================
-# MAIN SCRIPT EXECUTION
+# MAIN SCRIPT
 # ======================================================
 if __name__ == "__main__":
+    logger.info(f"🔍 Scanning directory: {ROOT_PATH}")
     files = find_excel_files(ROOT_PATH)
-    logger.info(f"📁 Found {len(files)} Excel files to process in {ROOT_PATH}")
+    logger.info(f"📂 Found {len(files)} Excel files to process")
+
+    if not files:
+        logger.warning("No Excel files found — exiting.")
+        exit()
 
     with engine.connect() as conn:
         for file_path in files:
             ingest_file(file_path, conn)
 
-    logger.info("🏁 Data ingestion completed successfully.")
+    logger.info("🏁 Ingestion completed successfully for all files.")
