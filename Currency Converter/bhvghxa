@@ -14,14 +14,14 @@ USERNAME = "your_username"
 PASSWORD = "your_password"
 HOST = "your_hostname"          # e.g. 10.20.30.40
 PORT = "1521"
-SERVICE_NAME = "orclpdb1"       # example service name
+SERVICE_NAME = "orclpdb1"
 
-ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"  # base folder
+ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"
 MAX_COLS = 40
-STORY_REGEX = r"US\d+"          # user story pattern (case-insensitive)
+STORY_REGEX = r"US\d+"
 
 # ======================================================
-# LOGGING CONFIGURATION
+# LOGGING
 # ======================================================
 logger = logging.getLogger("excel_oracle_ingest")
 logger.setLevel(logging.INFO)
@@ -31,15 +31,14 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # ======================================================
-# DATABASE CONNECTION (USING oracledb)
+# DATABASE CONNECTION USING oracledb
 # ======================================================
 DB_URL = f"oracle+oracledb://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/?service_name={SERVICE_NAME}"
-
 engine = create_engine(DB_URL)
 metadata = MetaData()
 
-# Define story_data table (40 CLOB columns)
-columns = [Column("story_id", String(50), primary_key=True)]
+# Define story_data table
+columns = [Column("story_id", String(50))]
 for i in range(1, MAX_COLS + 1):
     columns.append(Column(f"col{i}", OracleCLOB))
 
@@ -51,7 +50,7 @@ metadata.create_all(engine, checkfirst=True)
 # ======================================================
 
 def find_excel_files(root):
-    """Recursively find all Excel files"""
+    """Recursively find all Excel files."""
     excel_files = []
     for dirpath, _, filenames in os.walk(root):
         for f in filenames:
@@ -61,7 +60,7 @@ def find_excel_files(root):
 
 
 def extract_story_id(df):
-    """Find USxxxxx pattern anywhere in the Excel content"""
+    """Search for USxxxxx pattern anywhere in DataFrame."""
     try:
         text_data = df.astype(str).values.ravel()
         for val in text_data:
@@ -73,11 +72,21 @@ def extract_story_id(df):
     return None
 
 
-def flatten_excel_data(df):
-    """Flatten all cell values into a single list of strings (max 40)"""
-    values = df.astype(str).values.flatten().tolist()
+def clean_value(val):
+    """Convert to string, strip, and replace blanks with None."""
+    if pd.isna(val):
+        return None
+    val_str = str(val).strip()
+    if val_str.lower() in ("nan", "", "none", "null"):
+        return None
+    return val_str
+
+
+def prepare_row_data(row_series):
+    """Flatten row data into list of up to 40 cleaned values."""
+    values = [clean_value(v) for v in row_series.tolist()]
     if len(values) > MAX_COLS:
-        logger.warning(f"Truncating {len(values)} values to {MAX_COLS}")
+        logger.warning(f"Row truncated from {len(values)} to {MAX_COLS}")
         values = values[:MAX_COLS]
     elif len(values) < MAX_COLS:
         values += [None] * (MAX_COLS - len(values))
@@ -85,7 +94,7 @@ def flatten_excel_data(df):
 
 
 def ingest_file(file_path, conn):
-    """Process a single Excel file and insert into DB"""
+    """Process one Excel file: extract story ID and insert each row."""
     try:
         df = pd.read_excel(file_path, engine="openpyxl")
         if df.empty:
@@ -94,21 +103,24 @@ def ingest_file(file_path, conn):
 
         story_id = extract_story_id(df)
         if not story_id:
-            logger.warning(f"No story ID found in: {file_path}")
+            logger.warning(f"No story ID found in file: {file_path}")
             return
 
-        values = flatten_excel_data(df)
-        row = {"story_id": story_id}
-        for i in range(MAX_COLS):
-            row[f"col{i+1}"] = values[i]
+        inserted_rows = 0
+        for _, row in df.iterrows():
+            values = prepare_row_data(row)
+            record = {"story_id": story_id}
+            for i in range(MAX_COLS):
+                record[f"col{i+1}"] = values[i]
 
-        with conn.begin():
-            conn.execute(story_data.insert().values(**row))
+            with conn.begin():
+                conn.execute(story_data.insert().values(**record))
+            inserted_rows += 1
 
-        logger.info(f"✅ Inserted story {story_id} from {os.path.basename(file_path)}")
+        logger.info(f"Inserted {inserted_rows} rows for story {story_id} from {os.path.basename(file_path)}")
 
     except SQLAlchemyError as e:
-        logger.error(f"DB error while inserting {file_path}: {e}", exc_info=True)
+        logger.error(f"Database error while inserting {file_path}: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Error processing {file_path}: {e}", exc_info=True)
 
@@ -116,16 +128,22 @@ def ingest_file(file_path, conn):
 # MAIN SCRIPT
 # ======================================================
 if __name__ == "__main__":
-    logger.info(f"🔍 Scanning directory: {ROOT_PATH}")
+    print("Starting Excel ingestion...")
+    logger.info(f"Scanning directory: {ROOT_PATH}")
+
     files = find_excel_files(ROOT_PATH)
-    logger.info(f"📂 Found {len(files)} Excel files to process")
+    print(f"Found {len(files)} Excel files to process.")
+    logger.info(f"Found {len(files)} Excel files to process.")
 
     if not files:
-        logger.warning("No Excel files found — exiting.")
+        print("No Excel files found. Exiting.")
+        logger.warning("No Excel files found. Exiting.")
         exit()
 
     with engine.connect() as conn:
         for file_path in files:
+            print(f"Processing: {file_path}")
             ingest_file(file_path, conn)
 
-    logger.info("🏁 Ingestion completed successfully for all files.")
+    print("Data ingestion completed successfully.")
+    logger.info("Data ingestion completed successfully.")
