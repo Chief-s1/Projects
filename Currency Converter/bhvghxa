@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 # ======================================================
 USERNAME = "your_username"
 PASSWORD = "your_password"
-HOST = "your_hostname"          # e.g. 10.20.30.40
+HOST = "your_hostname"          # e.g. "10.20.30.40"
 PORT = "1521"
 SERVICE_NAME = "orclpdb1"
 
@@ -37,7 +37,7 @@ DB_URL = f"oracle+oracledb://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/?service_name={
 engine = create_engine(DB_URL)
 metadata = MetaData()
 
-# Define story_data table
+# Define story_data table dynamically
 columns = [Column("story_id", String(50))]
 for i in range(1, MAX_COLS + 1):
     columns.append(Column(f"col{i}", OracleCLOB))
@@ -60,7 +60,7 @@ def find_excel_files(root):
 
 
 def extract_story_id(df):
-    """Search for USxxxxx pattern anywhere in DataFrame."""
+    """Find USxxxxx pattern anywhere in the Excel."""
     try:
         text_data = df.astype(str).values.ravel()
         for val in text_data:
@@ -73,20 +73,20 @@ def extract_story_id(df):
 
 
 def clean_value(val):
-    """Convert to string, strip, and replace blanks with None."""
+    """Convert blank, nan, or null-like values to None for SQL NULL."""
     if pd.isna(val):
         return None
     val_str = str(val).strip()
-    if val_str.lower() in ("nan", "", "none", "null"):
+    if val_str.lower() in ("nan", "none", "null", ""):
         return None
     return val_str
 
 
 def prepare_row_data(row_series):
-    """Flatten row data into list of up to 40 cleaned values."""
+    """Prepare row data for DB insertion (pad or truncate to MAX_COLS)."""
     values = [clean_value(v) for v in row_series.tolist()]
     if len(values) > MAX_COLS:
-        logger.warning(f"Row truncated from {len(values)} to {MAX_COLS}")
+        logger.warning(f"Row has {len(values)} columns, truncating to {MAX_COLS}")
         values = values[:MAX_COLS]
     elif len(values) < MAX_COLS:
         values += [None] * (MAX_COLS - len(values))
@@ -94,7 +94,7 @@ def prepare_row_data(row_series):
 
 
 def ingest_file(file_path, conn):
-    """Process one Excel file: extract story ID and insert each row."""
+    """Read a single Excel file and insert all rows."""
     try:
         df = pd.read_excel(file_path, engine="openpyxl")
         if df.empty:
@@ -103,7 +103,7 @@ def ingest_file(file_path, conn):
 
         story_id = extract_story_id(df)
         if not story_id:
-            logger.warning(f"No story ID found in file: {file_path}")
+            logger.warning(f"No story ID found in: {file_path}")
             return
 
         inserted_rows = 0
@@ -118,17 +118,19 @@ def ingest_file(file_path, conn):
             inserted_rows += 1
 
         logger.info(f"Inserted {inserted_rows} rows for story {story_id} from {os.path.basename(file_path)}")
+        print(f"Inserted {inserted_rows} rows for story {story_id} from {os.path.basename(file_path)}")
 
     except SQLAlchemyError as e:
         logger.error(f"Database error while inserting {file_path}: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Error processing {file_path}: {e}", exc_info=True)
 
+
 # ======================================================
 # MAIN SCRIPT
 # ======================================================
 if __name__ == "__main__":
-    print("Starting Excel ingestion...")
+    print("Starting Excel ingestion process...")
     logger.info(f"Scanning directory: {ROOT_PATH}")
 
     files = find_excel_files(ROOT_PATH)
