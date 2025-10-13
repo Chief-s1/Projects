@@ -1,0 +1,250 @@
+import os, re, json, logging
+from openpyxl import load_workbook
+from sqlalchemy import create_engine, MetaData, Table, Column, String
+from sqlalchemy.dialects.oracle import CLOB as OracleCLOB, NUMBER
+from sqlalchemy.exc import SQLAlchemyError
+from logging.handlers import RotatingFileHandler
+
+# ======================================================
+# CONFIGURATION
+# ======================================================
+USERNAME = "your_username"
+PASSWORD = "your_password"
+HOST = "your_hostname"
+PORT = "1521"
+SERVICE_NAME = "orclpdb1"
+ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"
+STORY_REGEX = r"US\d+"
+
+# ======================================================
+# LOGGING SETUP
+# ======================================================
+os.makedirs("logs", exist_ok=True)
+
+info_logger = logging.getLogger("info_log")
+info_handler = RotatingFileHandler("logs/ingest_info.log", maxBytes=5*1024*1024, backupCount=3)
+info_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+info_logger.addHandler(info_handler)
+info_logger.setLevel(logging.INFO)
+
+error_logger = logging.getLogger("error_log")
+error_handler = RotatingFileHandler("logs/ingest_error.log", maxBytes=5*1024*1024, backupCount=3)
+error_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+error_logger.addHandler(error_handler)
+error_logger.setLevel(logging.ERROR)
+
+# ======================================================
+# DATABASE CONNECTION
+# ======================================================
+DB_URL = f"oracle+oracledb://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/?service_name={SERVICE_NAME}"
+engine = create_engine(DB_URL)
+metadata = MetaData()
+
+story_metadata = Table(
+    "story_metadata", metadata,
+    Column("story_id", String(50)),
+    Column("request_description", OracleCLOB),
+    Column("scenario_sheet", OracleCLOB),
+    Column("work_track", OracleCLOB),
+    Column("result_location", OracleCLOB),
+    Column("sprint_status", OracleCLOB),
+    Column("defect", OracleCLOB),
+    Column("results_summary", OracleCLOB),
+    Column("observations", OracleCLOB),
+    Column("output_logs", OracleCLOB),
+    Column("extra_metadata", OracleCLOB)
+)
+
+story_results = Table(
+    "story_results", metadata,
+    Column("id", NUMBER),  # identity column (no PK)
+    Column("story_id", String(50)),
+    Column("col1", OracleCLOB),
+    Column("col2", OracleCLOB),
+    Column("col3", OracleCLOB),
+    Column("col4", OracleCLOB),
+    Column("col5", OracleCLOB),
+    Column("col6", OracleCLOB)
+)
+
+metadata.create_all(engine, checkfirst=True)
+
+# ======================================================
+# NORMALIZATION MAP
+# ======================================================
+NORMALIZE_KEYS = {
+    "story id": "story_id", "storyid": "story_id", "story-id": "story_id",
+    "request description": "request_description", "req desc": "request_description", "desc": "request_description",
+    "scenario sheet": "scenario_sheet", "sheet scenario": "scenario_sheet", "scenario": "scenario_sheet",
+    "work track": "work_track", "worktrack": "work_track", "track": "work_track",
+    "result location": "result_location", "result path": "result_location", "result folder": "result_location",
+    "psi /sprint status": "sprint_status", "sprint status": "sprint_status", "status": "sprint_status",
+    "defect": "defect", "defects": "defect", "bugs": "defect",
+    "results": "results_summary", "test results": "results_summary",
+    "observations": "observations", "observation": "observations",
+    "recommendations": "observations", "comments": "observations", "notes": "observations",
+    "output logs": "output_logs", "output log": "output_logs", "logs": "output_logs",
+    "output and logs file": "output_logs", "output file": "output_logs"
+}
+
+def normalize_key(key):
+    if not key:
+        return None
+    k = str(key).strip().lower()
+    k = re.sub(r"[^a-z0-9\s]", " ", k)
+    k = re.sub(r"\s+", " ", k)
+    return NORMALIZE_KEYS.get(k, None)
+
+# ======================================================
+# UTILITIES
+# ======================================================
+def find_excel_files(root):
+    files = []
+    for dp, _, fns in os.walk(root):
+        for f in fns:
+            if f.lower().endswith((".xlsx", ".xls")):
+                files.append(os.path.join(dp, f))
+    return files
+
+def extract_story_id(sheet):
+    for row in sheet.iter_rows(values_only=True):
+        for val in row:
+            if val and isinstance(val, str):
+                m = re.search(STORY_REGEX, val, re.IGNORECASE)
+                if m:
+                    return m.group(0).upper()
+    return None
+
+def clean_value(val):
+    if val is None:
+        return None
+    v = str(val).strip()
+    return None if v.lower() in ("", "none", "nan", "null") else v
+
+# ======================================================
+# INGESTION
+# ======================================================
+def ingest_file(file_path, conn):
+    try:
+        wb = load_workbook(file_path, data_only=True)
+        sheet = wb.active
+        story_id = extract_story_id(sheet)
+        if not story_id:
+            info_logger.warning(f"No Story ID found in {file_path}")
+            return
+
+        metadata_dict = {"story_id": story_id}
+        extra_fields = {}
+        result_started = False
+        result_rows = []
+
+        for row in sheet.iter_rows(values_only=True):
+            cells = [clean_value(c) for c in row]
+            if not any(cells):
+                continue
+
+            first_cell = str(cells[0]).strip().lower() if cells[0] else ""
+
+            if not result_started:
+                normalized = normalize_key(first_cell)
+                if normalized:
+                    metadata_dict[normalized] = cells[1] if len(cells) > 1 else None
+                    continue
+
+                if len(cells) >= 2:
+                    key = str(cells[0]).strip()
+                    val = str(cells[1]).strip() if cells[1] else None
+                    if key and val:
+                        extra_fields[key] = val
+                    continue
+
+                if "results" in first_cell:
+                    result_started = True
+                    continue
+
+            else:
+                filtered_row = [c for c in cells if c not in (None, "", " ")]
+                if filtered_row:
+                    result_rows.append(filtered_row)
+
+        if extra_fields:
+            metadata_dict["extra_metadata"] = json.dumps(extra_fields, ensure_ascii=False)
+
+        with conn.begin():
+            conn.execute(story_metadata.insert().values(**metadata_dict))
+
+        if result_rows:
+            transposed = list(zip(*result_rows))
+            non_empty_indices = [
+                i for i, col_vals in enumerate(transposed)
+                if any(v not in (None, "", " ") for v in col_vals)
+            ]
+            compact_rows = [[row[i] for i in non_empty_indices if i < len(row)] for row in result_rows]
+
+            for row in compact_rows:
+                record = {"story_id": story_id}
+                for i, val in enumerate(row[:6]):
+                    record[f"col{i+1}"] = val
+                with conn.begin():
+                    conn.execute(story_results.insert().values(**record))
+
+        info_logger.info(f"{story_id}: {len(result_rows)} result rows from {os.path.basename(file_path)}")
+        print(f"{story_id}: {len(result_rows)} result rows inserted")
+
+    except SQLAlchemyError as e:
+        error_logger.error(f"DB error for {file_path}: {e}", exc_info=True)
+    except Exception as e:
+        error_logger.error(f"Processing error for {file_path}: {e}", exc_info=True)
+
+# ======================================================
+# MAIN
+# ======================================================
+if __name__ == "__main__":
+    print("Starting Excel ingestion...")
+    info_logger.info(f"Scanning directory: {ROOT_PATH}")
+
+    files = find_excel_files(ROOT_PATH)
+    print(f"Found {len(files)} Excel files.")
+    info_logger.info(f"Found {len(files)} Excel files.")
+
+    if not files:
+        print("No Excel files found. Exiting.")
+        info_logger.warning("No Excel files found.")
+        exit()
+
+    with engine.connect() as conn:
+        for f in files:
+            print(f"Processing: {f}")
+            ingest_file(f, conn)
+
+    print("Ingestion complete. Check logs in /logs/")
+    info_logger.info("Ingestion complete.")
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE TABLE story_metadata (
+    story_id            VARCHAR2(50),
+    request_description CLOB,
+    scenario_sheet      CLOB,
+    work_track          CLOB,
+    result_location     CLOB,
+    sprint_status       CLOB,
+    defect              CLOB,
+    results_summary     CLOB,
+    observations        CLOB,
+    output_logs         CLOB,
+    extra_metadata      CLOB
+);
+
+CREATE TABLE story_results (
+    id          NUMBER GENERATED BY DEFAULT AS IDENTITY,
+    story_id    VARCHAR2(50),
+    col1        CLOB,
+    col2        CLOB,
+    col3        CLOB,
+    col4        CLOB,
+    col5        CLOB,
+    col6        CLOB
+);
