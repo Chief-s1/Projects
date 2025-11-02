@@ -1,73 +1,120 @@
-import os, re, json, logging
-from openpyxl import load_workbook
-from sqlalchemy import create_engine, MetaData, Table, Column, String
-from sqlalchemy.dialects.oracle import CLOB as OracleCLOB, NUMBER
+import os
+import re
+import json
+import logging
+import unicodedata
+from datetime import datetime
+from contextlib import contextmanager
+
+from openpyxl import load_workbook, Workbook
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column, String, Integer, Text, Identity
+)
 from sqlalchemy.exc import SQLAlchemyError
+
+# ======================================================
+# CONFIGURATION (env-driven; fallbacks for demo)
+# ======================================================
+ROOT_PATH = os.getenv("ROOT_PATH", r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results")
+DB_URL = os.getenv("DB_URL", "sqlite:///ingest.db")  # <- change to Postgres/Oracle in prod
+RESULT_TOKENS = {"results", "test results", "execution results", "result summary"}
+STORY_REGEX = r"US\d+"  # change if your IDs differ
+MAX_RESULT_COLS = 6     # keep your current schema; adjust if needed
+
+os.makedirs("logs", exist_ok=True)
+os.makedirs("file_logs", exist_ok=True)
+
+# ======================================================
+# LOGGING (master rotating log)
+# ======================================================
 from logging.handlers import RotatingFileHandler
 
-# ======================================================
-# CONFIGURATION
-# ======================================================
-USERNAME = "your_username"
-PASSWORD = "your_password"
-HOST = "your_hostname"
-PORT = "1521"
-SERVICE_NAME = "orclpdb1"
-ROOT_PATH = r"\\atlsa\gys\GWMP\PgsT\Pe22.32\Results"
-STORY_REGEX = r"US\d+"
+logger = logging.getLogger("ingest")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    master_handler = RotatingFileHandler("logs/ingest_master.log", maxBytes=5*1024*1024, backupCount=5)
+    master_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(master_handler)
 
 # ======================================================
-# LOGGING SETUP
+# PER-FILE EXCEL LOGGING
 # ======================================================
-os.makedirs("logs", exist_ok=True)
+def _excel_log_path(source_path: str) -> str:
+    base = os.path.splitext(os.path.basename(source_path))[0]
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+    return os.path.join("file_logs", f"{safe}.xlsx")
 
-info_logger = logging.getLogger("info_log")
-info_handler = RotatingFileHandler("logs/ingest_info.log", maxBytes=5*1024*1024, backupCount=3)
-info_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-info_logger.addHandler(info_handler)
-info_logger.setLevel(logging.INFO)
+def xlog_init(path: str):
+    """Create a new Excel log file with headers if it doesn't exist."""
+    if os.path.exists(path):
+        return
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Log"
+    ws.append(["timestamp", "level", "message"])
+    wb.save(path)
+    wb.close()
 
-error_logger = logging.getLogger("error_log")
-error_handler = RotatingFileHandler("logs/ingest_error.log", maxBytes=5*1024*1024, backupCount=3)
-error_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-error_logger.addHandler(error_handler)
-error_logger.setLevel(logging.ERROR)
+def xlog_write(path: str, level: str, message: str):
+    """Append a row to the Excel log."""
+    try:
+        if not os.path.exists(path):
+            xlog_init(path)
+        wb = load_workbook(path)
+        ws = wb["Log"]
+        ws.append([datetime.now().isoformat(timespec="seconds"), level.upper(), message])
+        wb.save(path)
+        wb.close()
+    except Exception as e:
+        # Fall back to master log if Excel write fails
+        logger.error(f"Per-file Excel log failed for {path}: {e}", exc_info=True)
+
+def flog(path: str, level: str, message: str):
+    """Log both to master and per-file Excel log."""
+    getattr(logger, level.lower())(f"[{os.path.basename(path)}] {message}")
+    xlog_write(_excel_log_path(path), level, message)
 
 # ======================================================
-# DATABASE CONNECTION
+# DATABASE
 # ======================================================
-DB_URL = f"oracle+oracledb://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/?service_name={SERVICE_NAME}"
-engine = create_engine(DB_URL)
+engine = create_engine(DB_URL, future=True)
 metadata = MetaData()
 
+# Use Text() which maps to CLOB/TEXT appropriately (Oracle/Postgres/SQLite)
 story_metadata = Table(
     "story_metadata", metadata,
     Column("story_id", String(50)),
-    Column("request_description", OracleCLOB),
-    Column("scenario_sheet", OracleCLOB),
-    Column("work_track", OracleCLOB),
-    Column("result_location", OracleCLOB),
-    Column("sprint_status", OracleCLOB),
-    Column("defect", OracleCLOB),
-    Column("results_summary", OracleCLOB),
-    Column("observations", OracleCLOB),
-    Column("output_logs", OracleCLOB),
-    Column("extra_metadata", OracleCLOB)
+    Column("request_description", Text),
+    Column("scenario_sheet", Text),
+    Column("work_track", Text),
+    Column("result_location", Text),
+    Column("sprint_status", Text),
+    Column("defect", Text),
+    Column("results_summary", Text),
+    Column("observations", Text),
+    Column("output_logs", Text),
+    Column("extra_metadata", Text),
 )
 
 story_results = Table(
     "story_results", metadata,
-    Column("id", NUMBER),  # identity column (no PK)
-    Column("story_id", String(50)),
-    Column("col1", OracleCLOB),
-    Column("col2", OracleCLOB),
-    Column("col3", OracleCLOB),
-    Column("col4", OracleCLOB),
-    Column("col5", OracleCLOB),
-    Column("col6", OracleCLOB)
+    Column("id", Integer, Identity(always=False), nullable=False),
+    Column("story_id", String(50), index=True),
+    Column("col1", Text),
+    Column("col2", Text),
+    Column("col3", Text),
+    Column("col4", Text),
+    Column("col5", Text),
+    Column("col6", Text),
 )
 
 metadata.create_all(engine, checkfirst=True)
+
+@contextmanager
+def db_connect():
+    with engine.connect() as conn:
+        yield conn
 
 # ======================================================
 # NORMALIZATION MAP
@@ -90,48 +137,76 @@ NORMALIZE_KEYS = {
 def normalize_key(key):
     if not key:
         return None
-    k = str(key).strip().lower()
-    k = re.sub(r"[^a-z0-9\s]", " ", k)
-    k = re.sub(r"\s+", " ", k)
-    return NORMALIZE_KEYS.get(k, None)
+    k = str(key).lower()
+    k = re.sub(r"[^a-z0-9\s:/-]", " ", k)
+    k = re.sub(r"\s+", " ", k).strip()
+    return NORMALIZE_KEYS.get(k)
 
 # ======================================================
-# UTILITIES
+# CLEANERS / HELPERS
 # ======================================================
-def find_excel_files(root):
-    files = []
-    for dp, _, fns in os.walk(root):
-        for f in fns:
-            if f.lower().endswith((".xlsx", ".xls")):
-                files.append(os.path.join(dp, f))
-    return files
+ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\ufeff"}
+NBSP = "\xa0"
 
-def extract_story_id(sheet):
-    for row in sheet.iter_rows(values_only=True):
-        for val in row:
-            if val and isinstance(val, str):
-                m = re.search(STORY_REGEX, val, re.IGNORECASE)
-                if m:
-                    return m.group(0).upper()
-    return None
+def _strip_specials(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    # keep tabs/newlines for now, then collapse whitespace later
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C" or ch in "\t\n\r")
+    for zw in ZERO_WIDTH:
+        s = s.replace(zw, "")
+    s = s.replace(NBSP, " ")
+    # collapse whitespace including \r \n \t
+    s = " ".join(s.split())
+    return s.strip()
 
 def clean_value(val):
     if val is None:
         return None
-    v = str(val).strip()
-    return None if v.lower() in ("", "none", "nan", "null") else v
+    s = _strip_specials(str(val))
+    return None if s == "" or s.lower() in {"none", "nan", "null"} else s
+
+def find_excel_files(root):
+    files = []
+    for dp, _, fns in os.walk(root):
+        for f in fns:
+            lf = f.lower()
+            # openpyxl supports these; we exclude legacy .xls
+            if lf.endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+                files.append(os.path.join(dp, f))
+    return files
+
+def extract_story_id(sheet):
+    pat = re.compile(STORY_REGEX, re.IGNORECASE)
+    for row in sheet.iter_rows(values_only=True):
+        for val in row:
+            if isinstance(val, str):
+                m = pat.search(val)
+                if m:
+                    return m.group(0).upper()
+    return None
 
 # ======================================================
 # INGESTION
 # ======================================================
-def ingest_file(file_path, conn):
+def ingest_file(file_path: str, conn):
+    xlog_init(_excel_log_path(file_path))
+    flog(file_path, "info", "Starting ingestion")
+
     try:
-        wb = load_workbook(file_path, data_only=True)
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+    except Exception as e:
+        flog(file_path, "error", f"Failed to open workbook: {e}")
+        return
+
+    try:
         sheet = wb.active
+
         story_id = extract_story_id(sheet)
         if not story_id:
-            info_logger.warning(f"No Story ID found in {file_path}")
+            flog(file_path, "warning", "No Story ID found. Skipping file.")
             return
+        flog(file_path, "info", f"Detected story_id: {story_id}")
 
         metadata_dict = {"story_id": story_id}
         extra_fields = {}
@@ -139,112 +214,109 @@ def ingest_file(file_path, conn):
         result_rows = []
 
         for row in sheet.iter_rows(values_only=True):
+            # Clean cells once
             cells = [clean_value(c) for c in row]
-            if not any(cells):
+            # If all cleaned cells are None -> skip
+            if not any(c is not None for c in cells):
                 continue
 
-            first_cell = str(cells[0]).strip().lower() if cells[0] else ""
-
+            # Detect results header anywhere on the row (ignoring junk/newlines)
             if not result_started:
-                normalized = normalize_key(first_cell)
-                if normalized:
-                    metadata_dict[normalized] = cells[1] if len(cells) > 1 else None
-                    continue
-
-                if len(cells) >= 2:
-                    key = str(cells[0]).strip()
-                    val = str(cells[1]).strip() if cells[1] else None
-                    if key and val:
-                        extra_fields[key] = val
-                    continue
-
-                if "results" in first_cell:
+                if any((_strip_specials(c or "").lower() in RESULT_TOKENS) for c in cells if c is not None):
                     result_started = True
+                    flog(file_path, "info", "Entered results section")
                     continue
 
-            else:
-                filtered_row = [c for c in cells if c not in (None, "", " ")]
-                if filtered_row:
-                    result_rows.append(filtered_row)
+                # Try "Key: Value" in any cell
+                kv_matched = False
+                for c in cells:
+                    if c and ":" in c:
+                        k, v = c.split(":", 1)
+                        k, v = clean_value(k), clean_value(v)
+                        if k and v:
+                            norm = normalize_key(k)
+                            if norm:
+                                metadata_dict[norm] = v
+                                flog(file_path, "info", f"Metadata[{norm}] = <set>")
+                            else:
+                                extra_fields[k] = v
+                                flog(file_path, "info", f"ExtraMeta[{k}] = <set>")
+                            kv_matched = True
+                            break
+                if kv_matched:
+                    continue
 
+                # Fallback: 2-column KV (A->key, B->val) if both non-empty
+                if len(cells) >= 2 and cells[0] is not None and cells[1] is not None:
+                    norm = normalize_key(cells[0])
+                    if norm:
+                        metadata_dict[norm] = cells[1]
+                        flog(file_path, "info", f"Metadata[{norm}] = <set>")
+                    else:
+                        extra_fields[cells[0]] = cells[1]
+                        flog(file_path, "info", f"ExtraMeta[{cells[0]}] = <set>")
+                    continue
+
+                # Not results, not metadata — ignore noisy row
+                continue
+
+            # RESULTS mode: pack non-empty cells leftwards per row
+            non_empty = [c for c in cells if c is not None]
+            if non_empty:
+                result_rows.append(non_empty)
+
+        # Attach extra fields JSON if present
         if extra_fields:
             metadata_dict["extra_metadata"] = json.dumps(extra_fields, ensure_ascii=False)
 
-        with conn.begin():
-            conn.execute(story_metadata.insert().values(**metadata_dict))
+        # Insert in a single transaction
+        try:
+            with conn.begin():
+                # Only insert metadata keys that actually exist (already ensured)
+                conn.execute(story_metadata.insert().values(**metadata_dict))
 
-        if result_rows:
-            transposed = list(zip(*result_rows))
-            non_empty_indices = [
-                i for i, col_vals in enumerate(transposed)
-                if any(v not in (None, "", " ") for v in col_vals)
-            ]
-            compact_rows = [[row[i] for i in non_empty_indices if i < len(row)] for row in result_rows]
+                if result_rows:
+                    records = []
+                    for row_vals in result_rows:
+                        rec = {"story_id": story_id}
+                        for i, val in enumerate(row_vals[:MAX_RESULT_COLS]):
+                            rec[f"col{i+1}"] = val
+                        records.append(rec)
+                    conn.execute(story_results.insert(), records)
 
-            for row in compact_rows:
-                record = {"story_id": story_id}
-                for i, val in enumerate(row[:6]):
-                    record[f"col{i+1}"] = val
-                with conn.begin():
-                    conn.execute(story_results.insert().values(**record))
+            flog(file_path, "info", f"Inserted metadata + {len(result_rows)} result rows")
+        except SQLAlchemyError as e:
+            flog(file_path, "error", f"Database error: {e}")
+            return
 
-        info_logger.info(f"{story_id}: {len(result_rows)} result rows from {os.path.basename(file_path)}")
-        print(f"{story_id}: {len(result_rows)} result rows inserted")
-
-    except SQLAlchemyError as e:
-        error_logger.error(f"DB error for {file_path}: {e}", exc_info=True)
     except Exception as e:
-        error_logger.error(f"Processing error for {file_path}: {e}", exc_info=True)
+        flog(file_path, "error", f"Processing error: {e}")
+        return
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    flog(file_path, "info", "Ingestion finished")
 
 # ======================================================
 # MAIN
 # ======================================================
 if __name__ == "__main__":
-    print("Starting Excel ingestion...")
-    info_logger.info(f"Scanning directory: {ROOT_PATH}")
-
+    logger.info(f"Scanning directory: {ROOT_PATH}")
     files = find_excel_files(ROOT_PATH)
-    print(f"Found {len(files)} Excel files.")
-    info_logger.info(f"Found {len(files)} Excel files.")
+    logger.info(f"Found {len(files)} Excel files")
 
     if not files:
-        print("No Excel files found. Exiting.")
-        info_logger.warning("No Excel files found.")
-        exit()
+        logger.warning("No Excel files found. Exiting.")
+        print("No Excel files found. Check ROOT_PATH.")
+        raise SystemExit(0)
 
-    with engine.connect() as conn:
+    with db_connect() as conn:
         for f in files:
-            print(f"Processing: {f}")
+            logger.info(f"Processing: {f}")
             ingest_file(f, conn)
 
-    print("Ingestion complete. Check logs in /logs/")
-    info_logger.info("Ingestion complete.")
-
-
-
------------------------------------------------------------------------------------------------------------------------------------------
-
-CREATE TABLE story_metadata (
-    story_id            VARCHAR2(50),
-    request_description CLOB,
-    scenario_sheet      CLOB,
-    work_track          CLOB,
-    result_location     CLOB,
-    sprint_status       CLOB,
-    defect              CLOB,
-    results_summary     CLOB,
-    observations        CLOB,
-    output_logs         CLOB,
-    extra_metadata      CLOB
-);
-
-CREATE TABLE story_results (
-    id          NUMBER GENERATED BY DEFAULT AS IDENTITY,
-    story_id    VARCHAR2(50),
-    col1        CLOB,
-    col2        CLOB,
-    col3        CLOB,
-    col4        CLOB,
-    col5        CLOB,
-    col6        CLOB
-);
+    logger.info("Ingestion complete. Check 'logs/' for master log and 'file_logs/' for per-file Excel logs.")
+    print("Ingestion complete. See logs/ and file_logs/")
