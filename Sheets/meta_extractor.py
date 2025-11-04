@@ -3,7 +3,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from openpyxl import load_workbook
 
-# ---- CONFIG ----
 FOLDERS_FILE = Path(r"C:\Users\Swayam\Desktop\folders.txt")
 OUT_JSONL = Path("all_folders_story_ids.jsonl")
 FAILED_LIST = Path("failed_files.txt")
@@ -11,29 +10,18 @@ LOG_FILE = Path("run.log")
 
 RE_STORY = re.compile(r"\bUS\d{5}\b", re.IGNORECASE)
 
-# ---- LOGGING ----
 def setup_logger():
-    logger = logging.getLogger("story_scan")
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
+    lg = logging.getLogger("story_scan")
+    lg.setLevel(logging.DEBUG)
+    lg.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    ch = logging.StreamHandler(); ch.setLevel(logging.INFO); ch.setFormatter(fmt); lg.addHandler(ch)
     fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
+    fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); lg.addHandler(fh)
+    return lg
 
 logger = setup_logger()
 
-# ---- HELPERS ----
 def normalize_spaces(s):
     if s is None: return ""
     return str(s).replace("\u00A0"," ").replace("\u200B","").strip()
@@ -73,9 +61,7 @@ def sheet_to_2d_resolved(ws):
         out.append(row)
     return out
 
-# ---- CORE ----
 def find_story_id_in_file(p: Path):
-    """Return (story_id, error_str). Logs sheet-level reads."""
     try:
         logger.debug(f"[open_workbook] {p}")
         wb = load_workbook(filename=str(p), data_only=True, read_only=False, keep_links=False)
@@ -85,7 +71,6 @@ def find_story_id_in_file(p: Path):
     except Exception as e:
         logger.warning(f"[open_error] {p} :: {e}")
         return None, f"open_error:{e}"
-
     try:
         for name in wb.sheetnames:
             try:
@@ -114,26 +99,41 @@ def find_story_id_in_file(p: Path):
         logger.error(f"[read_error] {p} :: {e}")
         return None, f"read_error:{e}"
 
+def name_matches_final_results(folder_name: str) -> bool:
+    s = folder_name
+    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+    s = s.replace('_',' ').replace('-',' ')
+    s = re.sub(r'[^0-9a-zA-Z]+',' ', s).lower()
+    s = re.sub(r'\s+',' ', s).strip()
+    tokens = s.split()
+    has_final = 'final' in tokens
+    has_result = any(t in ('result','results') for t in tokens)
+    phrase_fwd = re.search(r'\bfinal\s*result(s)?\b', s) is not None
+    phrase_rev = re.search(r'\bresult(s)?\s*final\b', s) is not None
+    return (has_final and has_result) or phrase_fwd or phrase_rev
+
 def read_roots_from_file(file_path: Path):
     try:
         lines = file_path.read_text(encoding="utf-8-sig").splitlines()
         logger.info(f"[folders_file_opened] {file_path}")
     except PermissionError:
-        logger.error(f"[folders_file_permission] {file_path}")
-        return []
+        logger.error(f"[folders_file_permission] {file_path}"); return []
     except FileNotFoundError:
-        logger.error(f"[folders_file_missing] {file_path}")
-        return []
+        logger.error(f"[folders_file_missing] {file_path}"); return []
     roots=[]
     for line in lines:
         s=line.strip().strip('"').strip("'")
         if not s or s.startswith("#"): continue
         p=Path(s)
         if p.is_dir():
-            roots.append(p)
+            if name_matches_final_results(p.name):
+                roots.append(p)
+                logger.info(f"[root_selected] {p}")
+            else:
+                logger.info(f"[root_skipped_by_name] {p}")
         else:
             logger.warning(f"[skip_invalid_folder] {s}")
-    logger.info(f"[folders_loaded] count={len(roots)}")
+    logger.info(f"[folders_loaded] selected={len(roots)}")
     return roots
 
 def iter_excel_files_recursive(root: Path):
@@ -143,9 +143,7 @@ def iter_excel_files_recursive(root: Path):
             if name.lower().endswith(exts):
                 yield Path(base) / name
 
-# ---- RUN ----
 def main():
-    # fresh outputs
     for f in (OUT_JSONL, FAILED_LIST):
         try:
             if f.exists():
@@ -156,15 +154,12 @@ def main():
 
     if not FOLDERS_FILE.exists():
         logger.error(f"[folders_txt_not_found] {FOLDERS_FILE}")
-        print("folders.txt not found. Check FOLDERS_FILE in the script.")
-        return
+        print("folders.txt not found. Check FOLDERS_FILE in the script."); return
 
     roots = read_roots_from_file(FOLDERS_FILE)
     if not roots:
-        print("No valid folders found in folders.txt (or permission issue).")
-        return
+        print("No matching folders (must contain both 'final' and 'result(s)' in name)."); return
 
-    # open outputs once, write incrementally
     with OUT_JSONL.open("w", encoding="utf-8") as okf, FAILED_LIST.open("w", encoding="utf-8") as ff:
         logger.info(f"[write_open] {OUT_JSONL}")
         logger.info(f"[write_open] {FAILED_LIST}")
@@ -176,15 +171,13 @@ def main():
                 sid, err = find_story_id_in_file(fp)
                 if sid:
                     rec = {"root_folder": root_abs, "file_path": str(fp.resolve()), "story_id": sid}
-                    line = json.dumps(rec, ensure_ascii=False)
                     try:
-                        okf.write(line + "\n")
+                        okf.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         okf.flush()
                         logger.info(f"[write_jsonl] ok :: {fp}")
                     except Exception as we:
                         logger.error(f"[write_error] {OUT_JSONL} :: {we}")
                 else:
-                    # write failure entry
                     try:
                         ff.write(str(fp.resolve()) + (f"  # {err}" if err else "") + "\n")
                         ff.flush()
