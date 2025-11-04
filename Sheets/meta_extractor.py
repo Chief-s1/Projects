@@ -1,4 +1,4 @@
-import json, re
+import sys, re, json
 from pathlib import Path
 from openpyxl import load_workbook
 
@@ -62,38 +62,32 @@ def find_story_id_in_file(p: Path):
     except Exception:
         return None
 
-def read_folders_list(list_file: Path):
-    items=[]
-    for line in list_file.read_text(encoding="utf-8").splitlines():
-        s=line.strip().strip('"').strip("'")
-        if not s or s.startswith("#"): continue
-        p=Path(s)
-        if p.is_dir(): items.append(p)
-    return items
-
-def iter_excel_files_recursive(roots, follow_symlinks=False):
+def iter_excel_files_recursive(root: Path):
     patterns = ["*.xlsx","*.xlsm","*.xls"]
-    for root in roots:
-        for pat in patterns:
-            # rglob is recursive
-            yield from root.rglob(pat) if follow_symlinks else (p for p in root.rglob(pat) if not p.is_symlink())
+    for pat in patterns:
+        yield from root.rglob(pat)
 
 def main():
-    list_path = Path(input("Path to folders list (one folder per line): ").strip('" '))
-    out_json = Path("story_id_results.json")
+    if len(sys.argv) < 2:
+        print("Usage: python find_story_id.py <folder1> [<folder2> ...]")
+        sys.exit(1)
 
-    roots = read_folders_list(list_path)
+    roots = [Path(p) for p in sys.argv[1:]]
     results=[]
-    for fp in iter_excel_files_recursive(roots, follow_symlinks=False):
-        sid = find_story_id_in_file(fp)
-        if sid:
-            results.append({"file_path": str(fp.resolve()), "story_id": sid})
-            print(f"[✓] {sid} :: {fp}")
-        else:
-            print(f"[x] no story_id :: {fp}")
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            print(f"[skip] not a folder or missing: {root}")
+            continue
+        for fp in iter_excel_files_recursive(root):
+            sid = find_story_id_in_file(fp)
+            if sid:
+                results.append({"file_path": str(fp.resolve()), "story_id": sid})
+                print(f"[✓] {sid} :: {fp}")
+            else:
+                print(f"[x] no story_id :: {fp}")
 
-    out_json.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nSaved: {out_json}")
+    Path("story_id_results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("\n✅ Saved results to story_id_results.json")
 
 if __name__ == "__main__":
     main()
