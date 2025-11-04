@@ -99,9 +99,9 @@ def find_story_id_in_file(p: Path):
         logger.error(f"[read_error] {p} :: {e}")
         return None, f"read_error:{e}"
 
-def name_matches_final_results(folder_name: str) -> bool:
-    s = folder_name
-    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+def file_name_matches_final_results(file_path: Path) -> bool:
+    stem = file_path.stem
+    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', stem)
     s = s.replace('_',' ').replace('-',' ')
     s = re.sub(r'[^0-9a-zA-Z]+',' ', s).lower()
     s = re.sub(r'\s+',' ', s).strip()
@@ -126,14 +126,11 @@ def read_roots_from_file(file_path: Path):
         if not s or s.startswith("#"): continue
         p=Path(s)
         if p.is_dir():
-            if name_matches_final_results(p.name):
-                roots.append(p)
-                logger.info(f"[root_selected] {p}")
-            else:
-                logger.info(f"[root_skipped_by_name] {p}")
+            roots.append(p)
+            logger.info(f"[root_loaded] {p}")
         else:
             logger.warning(f"[skip_invalid_folder] {s}")
-    logger.info(f"[folders_loaded] selected={len(roots)}")
+    logger.info(f"[folders_loaded] count={len(roots)}")
     return roots
 
 def iter_excel_files_recursive(root: Path):
@@ -141,7 +138,11 @@ def iter_excel_files_recursive(root: Path):
     for base, _, files in os.walk(root):
         for name in files:
             if name.lower().endswith(exts):
-                yield Path(base) / name
+                fp = Path(base) / name
+                if file_name_matches_final_results(fp):
+                    yield fp
+                else:
+                    logger.debug(f"[file_skipped_by_name] {fp}")
 
 def main():
     for f in (OUT_JSONL, FAILED_LIST):
@@ -158,7 +159,7 @@ def main():
 
     roots = read_roots_from_file(FOLDERS_FILE)
     if not roots:
-        print("No matching folders (must contain both 'final' and 'result(s)' in name)."); return
+        print("No valid parent folders found."); return
 
     with OUT_JSONL.open("w", encoding="utf-8") as okf, FAILED_LIST.open("w", encoding="utf-8") as ff:
         logger.info(f"[write_open] {OUT_JSONL}")
