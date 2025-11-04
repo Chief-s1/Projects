@@ -14,22 +14,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-FINAL_NAME_REGEX = re.compile(r"(?i).*final\W*results?.*\.(xlsx|xlsm)$")
 HEADER_ROWS_TO_SNIFF = 3
 MAX_ROWS_TO_SCAN_FOR_VALUES = 200
 RECOGNIZED_EXTS = {".xlsx", ".xlsm"}
 
-REQ_DESC_HEADERS = ["request_description"]
-WORK_TRACK_HEADERS = ["work_track", "workstream", "work_stream", "track"]
-RESULT_LOC_HEADERS = ["result_location", "sprint"]
-OUTPUT_LOGS_HEADERS = ["output_and_logs", "output_logs", "outputs_and_logs"]
-
-RE_STORY = re.compile(r"\bUS\d{3,}\b", re.IGNORECASE)
-RE_SPRINTS = [
-    re.compile(r"\bPE\s*\d+(?:\.\d+)?\b", re.IGNORECASE),
-    re.compile(r"\bPI\s*\d+(?:\.\d+)?\b", re.IGNORECASE),
-    re.compile(r"\b(?:Sprint|S|SPR)\s*\d+\b", re.IGNORECASE),
-]
+RE_STORY = re.compile(r"\bUS\d{5}\b", re.IGNORECASE)
+RE_SPRINT = re.compile(r"\bPE[ _]\d{2}\.\d{2}\b", re.IGNORECASE)
 
 WHITESPACE_RUN = re.compile(r"[ \t\r\f\v\u00A0\u200B]+")
 NEWLINE_RUN = re.compile(r"[\n\r]+")
@@ -66,67 +56,24 @@ def normalize_spaces(s: Any) -> str:
     s = WHITESPACE_RUN.sub(" ", s)
     return s.strip()
 
-def normalize_header(s: str) -> str:
-    s = normalize_spaces(s).lower()
-    s = re.sub(r"[^0-9a-z]+", "_", s)
-    s = re.sub(r"_+", "_", s)
-    return s.strip("_")
-
-def find_first_header(headers: List[str], candidates: List[str]) -> Optional[int]:
-    norm = [normalize_header(h) for h in headers]
-    cand_norm = set(candidates)
-    for idx, h in enumerate(norm):
-        if h in cand_norm:
-            return idx
-    return None
-
 def filename_looks_like_final_results(path: Path) -> bool:
-    return bool(FINAL_NAME_REGEX.match(path.name))
+    stem = path.stem
+    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', stem)
+    s = s.replace('_', ' ').replace('-', ' ')
+    s = re.sub(r'[^0-9a-zA-Z]+', ' ', s).lower()
+    s = re.sub(r'\s+', ' ', s).strip()
+    tokens = s.split()
+    has_final = 'final' in tokens
+    has_result_token = any(t in ('result','results') for t in tokens)
+    phrase_fwd = re.search(r'\bfinal\s*result(s)?\b', s) is not None
+    phrase_rev = re.search(r'\bresult(s)?\s*final\b', s) is not None
+    return (has_final and has_result_token) or phrase_fwd or phrase_rev
 
 def to_abs(p: Path) -> str:
     try:
         return str(p.resolve())
     except Exception:
         return str(p.absolute())
-
-class DomainResolver:
-    def __init__(self, domains: List[str], aliases: Dict[str, str]):
-        self.canon = {self._norm(d): d for d in domains}
-        self.aliases = {self._norm(k): v for k, v in aliases.items()} if aliases else {}
-    def _norm(self, s: str) -> str:
-        s = normalize_spaces(s).lower()
-        s = re.sub(r"[^0-9a-z]+", "_", s)
-        s = re.sub(r"_+", "_", s)
-        return s.strip("_")
-    def resolve(self, text: str) -> Tuple[Optional[str], str]:
-        if not text: return None, "unresolved"
-        t = self._norm(text)
-        if t in self.canon: return self.canon[t], "exact"
-        if t in self.aliases: return self.aliases[t], "alias"
-        for k_norm, dom in self.canon.items():
-            if k_norm and k_norm in t: return dom, "contains"
-        for a_norm, dom in self.aliases.items():
-            if a_norm and a_norm in t: return dom, "contains"
-        return None, "unresolved"
-
-def load_domain_config(path: Optional[str], logger: logging.Logger) -> DomainResolver:
-    if not path:
-        logger.warning("No domain file provided; business_domain may be unresolved.")
-        return DomainResolver([], {})
-    p = Path(path)
-    if not p.exists():
-        logger.error(f"Domain file missing: {path}")
-        return DomainResolver([], {})
-    try:
-        if p.suffix.lower() == ".json":
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return DomainResolver(data.get("domains", []), data.get("aliases", {}))
-        else:
-            domains = [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
-            return DomainResolver(domains, {})
-    except Exception as e:
-        logger.error(f"Failed to load domain config: {e}")
-        return DomainResolver([], {})
 
 def merged_regions(ws: Worksheet) -> List[Dict[str, int]]:
     regs = []
@@ -162,84 +109,28 @@ def sheet_to_2d_resolved(ws: Worksheet) -> List[List[Any]]:
         data.append(row_vals)
     return data
 
-def consolidate_headers(grid: List[List[Any]], header_rows: int) -> Tuple[List[str], int]:
-    if not grid: return [], 0
-    rows = grid[:min(header_rows, len(grid))]
-    max_cols = max((len(r) for r in rows), default=0)
-    headers = []
-    for c in range(max_cols):
-        parts = []
-        for r in rows:
-            if c < len(r):
-                cell = r[c]
-                if cell:
-                    txt = normalize_spaces(str(cell))
-                    if txt: parts.append(txt)
-        headers.append(normalize_header(" ".join(parts)) if parts else f"col_{c+1}")
-    return headers, len(rows)
+def scan_entire_grid_for_story_and_sprint(grid: List[List[Any]]) -> Tuple[Optional[str], Optional[str]]:
+    story_id, sprint = None, None
+    for r in range(len(grid)):
+        row = grid[r]
+        for c in range(len(row)):
+            txt = normalize_spaces(row[c])
+            if not txt: continue
+            if story_id is None:
+                m = RE_STORY.search(txt)
+                if m: story_id = m.group(0).upper()
+            if sprint is None:
+                n = RE_SPRINT.search(txt)
+                if n:
+                    val = n.group(0)
+                    val = val.upper()
+                    val = val.replace("PE_", "PE ").replace("  ", " ")
+                    sprint = val
+            if story_id and sprint:
+                return story_id, sprint
+    return story_id, sprint
 
-def extract_required_fields(headers, grid, data_start_idx, resolver, logger, file_path, sheet_name, strict_domain=False):
-    req_desc_idx = find_first_header(headers, REQ_DESC_HEADERS)
-    work_track_idx = find_first_header(headers, WORK_TRACK_HEADERS)
-    result_loc_idx = find_first_header(headers, RESULT_LOC_HEADERS)
-    output_logs_idx = find_first_header(headers, OUTPUT_LOGS_HEADERS)
-    story_id = None
-    if req_desc_idx is not None:
-        for r in range(data_start_idx, min(len(grid), data_start_idx + MAX_ROWS_TO_SCAN_FOR_VALUES)):
-            row = grid[r]
-            if req_desc_idx < len(row):
-                cell = normalize_spaces(row[req_desc_idx])
-                if not cell: continue
-                m = RE_STORY.search(cell)
-                if m: story_id = m.group(0).upper(); break
-    sprint, result_loc_text = None, ""
-    if result_loc_idx is not None:
-        for r in range(data_start_idx, min(len(grid), data_start_idx + MAX_ROWS_TO_SCAN_FOR_VALUES)):
-            row = grid[r]
-            if result_loc_idx < len(row):
-                t = normalize_spaces(row[result_loc_idx])
-                if t:
-                    result_loc_text = t
-                    for rx in RE_SPRINTS:
-                        mm = rx.search(t)
-                        if mm:
-                            s = mm.group(0)
-                            s = re.sub(r"(?i)^(pe|pi|s|spr)\s*", lambda m: m.group(1).upper() + " ", s)
-                            s = re.sub(r"\s+", " ", s).strip()
-                            s = re.sub(r"(?i)^(spr)\s+(\d+)$", r"Sprint \2", s)
-                            s = re.sub(r"(?i)^(s)\s+(\d+)$", r"Sprint \2", s)
-                            sprint = s; break
-                    break
-    work_track = None
-    if work_track_idx is not None:
-        for r in range(data_start_idx, min(len(grid), data_start_idx + MAX_ROWS_TO_SCAN_FOR_VALUES)):
-            row = grid[r]
-            if work_track_idx < len(row):
-                t = normalize_spaces(row[work_track_idx])
-                if t: work_track = t; break
-    business_domain, domain_method = None, "unresolved"
-    lookup_texts = []
-    if result_loc_text: lookup_texts.append(result_loc_text)
-    if output_logs_idx is not None:
-        for r in range(data_start_idx, min(len(grid), data_start_idx + MAX_ROWS_TO_SCAN_FOR_VALUES)):
-            row = grid[r]
-            if output_logs_idx < len(row):
-                t = normalize_spaces(row[output_logs_idx])
-                if t: lookup_texts.append(t); break
-    for txt in lookup_texts:
-        dom, method = resolver.resolve(txt)
-        if dom: business_domain, domain_method = dom, method; break
-    missing = []
-    if not story_id: missing.append("story_id")
-    if not sprint: missing.append("sprint")
-    if strict_domain and not business_domain: missing.append("business_domain")
-    return {
-        "story_id": story_id, "work_track": work_track,
-        "sprint": sprint, "business_domain": business_domain,
-        "domain_method": domain_method, "missing": missing
-    }
-
-def process_file(path, resolver, sheet_name, strict_domain, logger, jsonl_handle):
+def process_file(path, logger, jsonl_handle):
     file_path = to_abs(path)
     t0 = datetime.now()
     try:
@@ -248,33 +139,48 @@ def process_file(path, resolver, sheet_name, strict_domain, logger, jsonl_handle
         logger.error(f"Failed to open workbook: {file_path} :: {e}")
         log_event(jsonl_handle, {"event": "open_file", "status": "error", "file_path": file_path, "error": str(e)})
         return None, f"open_failed:{e}"
+
     try:
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
-        merge_count = 0
-        if hasattr(ws, "merged_cells") and ws.merged_cells:
-            try: merge_count = len(ws.merged_cells.ranges)
-            except Exception: merge_count = 0
-        logger.info(f"[merge_info] {file_path} : {merge_count} merged ranges")
-        grid = sheet_to_2d_resolved(ws)
-        headers, data_start_idx = consolidate_headers(grid, HEADER_ROWS_TO_SNIFF)
-        fields = extract_required_fields(headers, grid, data_start_idx, resolver, logger, file_path, ws.title, strict_domain)
-        missing = fields.get("missing", [])
+        story_id, sprint = None, None
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            try:
+                merge_count = 0
+                if hasattr(ws, "merged_cells") and ws.merged_cells:
+                    try: merge_count = len(ws.merged_cells.ranges)
+                    except Exception: merge_count = 0
+                logger.debug(f"[merge_info] {file_path} :: {sheet_name} -> {merge_count} merges")
+                grid = sheet_to_2d_resolved(ws)
+                s_id, spr = scan_entire_grid_for_story_and_sprint(grid)
+                if s_id and not story_id: story_id = s_id
+                if spr and not sprint: sprint = spr
+                if story_id and sprint: break
+            except Exception as e:
+                logger.warning(f"[sheet_skip] {file_path} :: {sheet_name} :: {e}")
+
+        wb.close()
+
+        missing = []
+        if not story_id: missing.append("story_id")
+        if not sprint: missing.append("sprint")
         if missing:
-            wb.close()
             logger.error(f"[required_missing] {file_path} -> {missing}")
+            log_event(jsonl_handle, {"event": "extract_fields", "status": "error", "file_path": file_path, "missing": missing})
             return None, f"required_missing:{','.join(missing)}"
+
         record = {
             "file_path": file_path,
-            "story_id": fields["story_id"],
-            "work_track": fields["work_track"],
-            "sprint": fields["sprint"],
-            "business_domain": fields["business_domain"]
+            "story_id": story_id,
+            "sprint": sprint,
+            "work_track": None,
+            "business_domain": None
         }
-        wb.close()
+
         elapsed = int((datetime.now() - t0).total_seconds() * 1000)
         logger.info(f"[processed] {file_path} in {elapsed} ms")
-        log_event(jsonl_handle, {"event": "processed", "status": "success", "file_path": file_path})
+        log_event(jsonl_handle, {"event": "processed", "status": "success", "file_path": file_path, "elapsed_ms": elapsed, "record_preview": record})
         return record, None
+
     except Exception as e:
         tb = traceback.format_exc(limit=2)
         logger.error(f"[process_error] {file_path} :: {e}")
@@ -299,37 +205,43 @@ def main():
     ap.add_argument("root")
     ap.add_argument("--out-json", default="final_results_metadata.json")
     ap.add_argument("--failed-list", default="failed_files.txt")
-    ap.add_argument("--domains", default=None)
     ap.add_argument("--log-file", default="run.log")
     ap.add_argument("--events-jsonl", default=None)
-    ap.add_argument("--sheet-name", default=None)
-    ap.add_argument("--strict-domain", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
     a = ap.parse_args()
 
     logger, jsonl_handle = setup_logging(a.log_file, a.events_jsonl)
-    resolver = load_domain_config(a.domains, logger)
     root = Path(a.root)
     if not root.exists(): logger.error("Root path missing."); sys.exit(2)
+
     files = discover_files(root, logger)
     results, failed = [], []
     with cf.ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
-        futs = [ex.submit(process_file, p, resolver, a.sheet_name, a.strict_domain, logger, jsonl_handle) for p in files]
+        futs = [ex.submit(process_file, p, logger, jsonl_handle) for p in files]
         for fut, p in zip(futs, files):
             rec, err = fut.result()
             if rec: results.append(rec)
             else: failed.append((to_abs(p), err or "unknown_error"))
+
     try:
         Path(a.out_json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info(f"[output_json] {len(results)} -> {a.out_json}")
     except Exception as e:
         logger.error(f"Write output failed: {e}")
+
     try:
         uniq = sorted({p for p, _ in failed})
         Path(a.failed_list).write_text("\n".join(uniq), encoding="utf-8")
         logger.info(f"[failed_list] {len(uniq)} -> {a.failed_list}")
+        if failed:
+            reasons_path = str(Path(a.failed_list).with_suffix(".jsonl"))
+            with open(reasons_path, "w", encoding="utf-8") as fh:
+                for p, reason in failed:
+                    fh.write(json.dumps({"file_path": p, "reason": reason}, ensure_ascii=False) + "\n")
+            logger.info(f"[failed_reasons] {len(failed)} -> {reasons_path}")
     except Exception as e:
         logger.error(f"Write failed list failed: {e}")
+
     logger.info(f"[summary] ok={len(results)} failed={len(failed)} total={len(files)}")
     if jsonl_handle:
         try: jsonl_handle.close()
