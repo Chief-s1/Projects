@@ -1,4 +1,4 @@
-import sys, re, json
+import os, re, json
 from pathlib import Path
 from openpyxl import load_workbook
 
@@ -62,32 +62,51 @@ def find_story_id_in_file(p: Path):
     except Exception:
         return None
 
+def read_roots_from_file(list_file: Path):
+    roots=[]
+    for line in list_file.read_text(encoding="utf-8").splitlines():
+        s=line.strip().strip('"').strip("'")
+        if not s or s.startswith("#"): continue
+        p=Path(s)
+        if p.is_dir(): roots.append(p)
+    return roots
+
 def iter_excel_files_recursive(root: Path):
-    patterns = ["*.xlsx","*.xlsm","*.xls"]
-    for pat in patterns:
-        yield from root.rglob(pat)
+    exts = (".xlsx",".xlsm",".xls")
+    for base, _, files in os.walk(root):
+        for name in files:
+            if name.lower().endswith(exts):
+                yield Path(base) / name
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python find_story_id.py <folder1> [<folder2> ...]")
-        sys.exit(1)
+    list_path = input("Path to folders.txt (one folder per line): ").strip('" ')
+    out_json = Path("all_folders_story_ids.json")
+    list_file = Path(list_path)
+    if not list_file.exists():
+        print(f"folders file not found: {list_file}")
+        return
 
-    roots = [Path(p) for p in sys.argv[1:]]
+    roots = read_roots_from_file(list_file)
+    if not roots:
+        print("no valid folders found in file.")
+        return
+
     results=[]
     for root in roots:
-        if not root.exists() or not root.is_dir():
-            print(f"[skip] not a folder or missing: {root}")
-            continue
         for fp in iter_excel_files_recursive(root):
             sid = find_story_id_in_file(fp)
             if sid:
-                results.append({"file_path": str(fp.resolve()), "story_id": sid})
+                results.append({
+                    "root_folder": str(root.resolve()),
+                    "file_path": str(fp.resolve()),
+                    "story_id": sid
+                })
                 print(f"[✓] {sid} :: {fp}")
             else:
                 print(f"[x] no story_id :: {fp}")
 
-    Path("story_id_results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\n✅ Saved results to story_id_results.json")
+    out_json.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nSaved: {out_json}")
 
 if __name__ == "__main__":
     main()
