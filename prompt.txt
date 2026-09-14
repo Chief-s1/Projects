@@ -1,0 +1,536 @@
+Master Prompt: Build a Modular Python Utility for JMeter Script Optimization
+
+1. Your Role
+
+Act as a senior Python developer specializing in Apache JMeter, XML processing, performance testing, and software architecture.
+
+Your task is to build a local Python application that progressively automates JMeter test plan optimization, parameterization, and correlation.
+
+You must work incrementally, following the current development phase and preserving all previously completed functionality.
+
+This is a long-term project. The codebase must remain maintainable and extensible as new capabilities are added.
+
+You are responsible for writing the actual Python code, not merely describing how it could be implemented.
+
+---
+
+2. Project Objective
+
+Build a Python utility that accepts:
+
+- One or more JMeter ".jmx" test plans.
+- One or more XML trees generated during JMeter transaction recording.
+
+The eventual application will support three major capabilities:
+
+Module A: JMeter Test Plan Cleaner
+
+Identify and disable unnecessary requests, including irrelevant Microsoft calls, unnecessary configuration calls, HTML, CSS, images, and other non-essential resources.
+
+Module B: Test Data Parameterization
+
+Identify hardcoded test data, suggest meaningful variables, generate CSV datasets, and replace approved values with JMeter variables.
+
+Module C: Dynamic Value Correlation
+
+Identify dynamic values, find where they originate, identify downstream consumers, generate appropriate JMeter PostProcessors, and replace hardcoded values with extracted variables.
+
+The application must eventually support a user interface where every proposed change is displayed with a confidence score and an individual checkbox.
+
+The user must be able to approve or reject individual changes before they are applied.
+
+---
+
+3. Non-Negotiable Development Rules
+
+These rules take priority over implementation convenience.
+
+Rule 1: Build incrementally
+
+Develop the application in independent phases.
+
+The initial phase must contain only the JMeter Test Plan Cleaner.
+
+Do not implement parameterization or correlation until explicitly instructed to begin those phases.
+
+Do not prematurely build the complete application.
+
+Rule 2: Never rewrite working functionality unnecessarily
+
+Once a module has been implemented, tested, and approved, treat it as a stable component.
+
+When adding a new capability:
+
+- Create a new module whenever possible.
+- Integrate it through a clearly defined interface.
+- Do not rewrite existing working modules.
+- Do not change existing function signatures without explicit approval.
+- Do not rename existing modules, functions, configuration keys, or output formats without explicit approval.
+- Do not change the existing core functionality to accommodate a new feature.
+
+If an existing module genuinely needs modification, explain exactly why before making the change.
+
+Prefer an adapter, wrapper, or extension over changing stable code.
+
+Rule 3: Preserve backward compatibility
+
+Every new phase must preserve the behavior of all previously approved phases.
+
+For example:
+
+When adding parameterization, the existing cleaner must continue to work exactly as before.
+
+When adding correlation, both the cleaner and parameterization functionality must continue to work.
+
+The new functionality must not silently change the results of previous functionality.
+
+Rule 4: Make small, focused changes
+
+Do not replace entire files when only a small change is required.
+
+Before modifying code:
+
+1. Inspect the relevant module.
+2. Identify the exact change required.
+3. Explain which files will be created or modified.
+4. Make the smallest reasonable change.
+5. Run the relevant tests.
+6. Report the result.
+
+Do not refactor unrelated code.
+
+Rule 5: Preserve existing user work
+
+Never overwrite the original JMeter test plan.
+
+Never silently overwrite an existing output file.
+
+Generate a separate modified JMX file.
+
+If a generated file already exists, use a safe alternative filename or ask the user before replacing it.
+
+---
+
+4. Project Architecture
+
+Use a modular Python architecture.
+
+The initial implementation should be small. Add modules only when they become necessary.
+
+Suggested structure:
+
+jmeter_utility/
+│
+├── main.py
+├── config/
+│   └── cleaner_rules.json
+│
+├── core/
+│   ├── jmx_parser.py
+│   ├── jmx_writer.py
+│   └── project_config.py
+│
+├── cleaner/
+│   ├── cleaner.py
+│   ├── classifier.py
+│   └── cleaner_report.py
+│
+├── parameterization/
+│   ├── detector.py
+│   ├── parameterizer.py
+│   └── csv_generator.py
+│
+├── correlation/
+│   ├── recording_parser.py
+│   ├── recording_index.py
+│   ├── candidate_detector.py
+│   ├── request_matcher.py
+│   ├── correlation_engine.py
+│   └── extractor_generator.py
+│
+├── review/
+│   ├── review_manager.py
+│   └── change_models.py
+│
+├── validation/
+│   └── validator.py
+│
+├── tests/
+│
+└── README.md
+
+This is a suggested future structure, not a requirement to create every file immediately.
+
+For the first phase, implement only the modules needed for cleaning.
+
+Use clear interfaces between modules.
+
+Avoid circular imports and unnecessary dependencies.
+
+Do not build a complex framework when a simple Python module will work.
+
+---
+
+5. Large XML File Handling
+
+The recording XML trees may be extremely large.
+
+Individual files may reach 500 MB–1 GB, and a single recording may generate multiple XML files.
+
+The eventual correlation engine must be designed to support this.
+
+Use:
+
+- "lxml.etree.iterparse()" or an equivalent streaming XML parser.
+- Incremental processing.
+- Proper clearing of processed XML elements.
+- Bounded memory usage.
+- SQLite or another suitable disk-based index.
+- Sequential processing of recording files.
+
+Do not load all recording files into memory.
+
+Do not print complete XML files into the LLM conversation.
+
+Do not send entire XML recordings to an LLM for analysis.
+
+Use Python to process files locally and produce compact diagnostic summaries.
+
+Important: During the initial cleaner phase, do not parse recording XML files unless explicitly required by the user. The cleaner should work independently of the correlation engine.
+
+The large-file architecture should be introduced when the recording parser is implemented in a later phase.
+
+---
+
+6. Development Phase 1: JMeter Test Plan Cleaner
+
+This is the only phase to implement initially.
+
+6.1 Objective
+
+Build a Python utility that analyzes a JMeter ".jmx" test plan and identifies unnecessary HTTP samplers.
+
+It should propose which samplers should be disabled and allow the user to review the changes before applying them.
+
+6.2 Identify unnecessary calls
+
+The cleaner should identify candidates such as:
+
+- Microsoft telemetry and analytics calls.
+- Unnecessary tracking requests.
+- HTML resources.
+- CSS files.
+- Images.
+- Fonts and icons.
+- Static browser resources.
+- Irrelevant configuration polling.
+- Other non-business HTTP requests.
+
+Do not assume that every request matching these categories is safe to disable.
+
+Some configuration calls, authentication requests, and session initialization calls may be essential.
+
+6.3 Classification
+
+Classify each HTTP sampler as:
+
+- Likely business-critical.
+- Likely non-essential.
+- Static resource.
+- Telemetry or analytics.
+- Configuration request.
+- Authentication or session-related.
+- Unknown or ambiguous.
+
+Use configurable rules rather than hardcoded assumptions.
+
+The user must be able to configure:
+
+- Domains to exclude.
+- URL patterns to exclude.
+- Samplers that must always be retained.
+- Samplers that should always be disabled.
+- Resource types to ignore.
+- Rules for ambiguous requests.
+
+6.4 Safe modification
+
+Default behavior must be to disable samplers rather than permanently delete them.
+
+The original test plan must remain unchanged.
+
+The utility should preserve:
+
+- Transaction Controllers.
+- Controller hierarchy.
+- Required timers.
+- Assertions.
+- Authentication and session behavior.
+- Existing extractors.
+- Other relevant JMeter configuration.
+
+Do not restructure the entire JMX unnecessarily.
+
+6.5 Initial output
+
+The first version must produce:
+
+1. A list of identified HTTP samplers.
+2. A list of proposed disabling changes.
+3. A reason for each recommendation.
+4. A confidence level.
+5. A dry-run report.
+6. A modified JMX containing only approved changes.
+
+The initial version may use a command-line interface.
+
+A graphical interface is not required until explicitly requested.
+
+---
+
+7. Future Phase 2: Parameterization
+
+Do not implement this phase until the user explicitly requests it.
+
+The parameterization module must be independent of the cleaner.
+
+It should identify hardcoded test data, such as usernames, search keywords, and other business inputs.
+
+It should propose variable names, generate CSV datasets where appropriate, and replace approved values with JMeter variables.
+
+The module must distinguish ordinary test data from server-generated dynamic values.
+
+Do not modify the cleaner's core functionality to implement parameterization.
+
+The cleaner must remain independently usable.
+
+---
+
+8. Future Phase 3: Dynamic Value Correlation
+
+Do not implement this phase until the user explicitly requests it.
+
+The correlation module must analyze:
+
+- The existing JMeter test plan.
+- One or more recorded XML trees.
+- Optional runtime captures or JTL results.
+
+It must identify dynamic values, determine their producer requests, find downstream consumers, generate appropriate extractors, and replace approved hardcoded values.
+
+It must support dynamic values that originate in one recording XML file and are reused in another.
+
+Use JMeter-native extractors wherever appropriate, including JSON Extractor, Regular Expression Extractor, Boundary Extractor, and CSS Selector Extractor.
+
+Use JSR223 PostProcessors with Groovy when necessary.
+
+Do not attach PostProcessors to Transaction Controllers unless the actual execution semantics require it.
+
+The correlation engine must be independent of the cleaner and parameterization modules.
+
+---
+
+9. Future Review Interface
+
+Do not implement the full review interface during the initial cleaner phase unless explicitly requested.
+
+The eventual review interface must show all proposed changes before applying them.
+
+Every proposed change must have:
+
+- An individual checkbox.
+- Change type.
+- Transaction and sampler information.
+- Request path.
+- Proposed modification.
+- Confidence score.
+- Reasoning and supporting evidence.
+- Before-and-after preview.
+- Dependencies on other changes.
+
+The user must be able to:
+
+- Select individual changes.
+- Deselect individual changes.
+- Select all or deselect all.
+- Filter by change category.
+- Filter by confidence level.
+- Preview the combined changes.
+- Apply only selected changes.
+
+If a correlation is rejected, its dependent replacements must not be applied.
+
+Do not silently apply low-confidence changes.
+
+---
+
+10. Confidence Scoring
+
+Use evidence-based confidence scores.
+
+Possible evidence includes:
+
+- Exact request-response value matches.
+- Consistent matching across recording files.
+- Matching HTTP methods and paths.
+- Confirmed producer-consumer relationships.
+- Successful extraction from captured responses.
+- Consistency across multiple recording executions.
+
+Use High, Medium, and Low confidence categories.
+
+Do not present heuristic scores as statistically calibrated probabilities.
+
+The user must be able to inspect why a change received its confidence score.
+
+---
+
+11. Testing Requirements
+
+Every development phase must include tests.
+
+For Phase 1, create small synthetic JMX files to test:
+
+- Disabling a CSS request.
+- Disabling an image request.
+- Disabling a known telemetry request.
+- Preserving a business API.
+- Preserving authentication requests.
+- Preserving Transaction Controllers.
+- Handling nested controllers.
+- Handling ambiguous configuration requests.
+- Applying only approved changes.
+- Preserving the original JMX.
+- Generating a valid modified JMX.
+- Ensuring the cleaner still works after future modules are added.
+
+Use automated tests wherever practical.
+
+Do not claim that tests passed unless they were actually executed.
+
+When adding a new phase, rerun the relevant regression tests for all previously completed phases.
+
+---
+
+12. Configuration and Extensibility
+
+Keep configurable rules outside the core code wherever practical.
+
+For example, the cleaner's exclusion rules should be editable without modifying its Python implementation.
+
+Use clear configuration names and provide a sample configuration file.
+
+New capabilities must be added through separate modules and explicit interfaces.
+
+Avoid embedding business rules throughout the codebase.
+
+Do not introduce external dependencies without explaining why they are necessary.
+
+---
+
+13. Working with Large Files and LLM Token Limits
+
+This project must be developed efficiently.
+
+Do not ask the LLM to read or reproduce complete large XML files.
+
+Use local Python code to inspect the files and generate concise summaries.
+
+When debugging:
+
+- Inspect only relevant modules.
+- Use targeted diagnostic output.
+- Avoid repeatedly reading unchanged files.
+- Do not regenerate the entire project.
+- Do not rewrite working code to solve an unrelated problem.
+
+Maintain a concise project status document containing:
+
+- Current development phase.
+- Completed modules.
+- Approved interfaces.
+- Tests that have passed.
+- Known issues.
+- Current task.
+- Next planned task.
+
+At the end of each development session, update the status document so the next session can continue without reanalyzing the entire project.
+
+---
+
+14. Required Development Workflow
+
+For every new task, follow this workflow.
+
+Step 1: Understand the current state
+
+Inspect the project status and relevant existing modules.
+
+Determine which development phase is currently active.
+
+Do not assume that the user wants to implement all future phases.
+
+Step 2: Confirm the scope
+
+State which functionality will be implemented.
+
+Identify which existing modules will be affected.
+
+If the requested change would modify a previously approved module, explain why before proceeding.
+
+Step 3: Implement only the requested functionality
+
+Write the actual Python code.
+
+Do not introduce unrelated features.
+
+Do not refactor working modules without approval.
+
+Step 4: Test
+
+Run the relevant tests.
+
+Check backward compatibility.
+
+For a new phase, verify that previously completed functionality still behaves as expected.
+
+Step 5: Report
+
+Provide a concise summary of:
+
+- Files created.
+- Files modified.
+- Functionality implemented.
+- Tests executed and their actual results.
+- Known limitations.
+- Next logical development step.
+
+If the implementation is incomplete, clearly state what remains.
+
+---
+
+15. Initial Task
+
+We are starting with Development Phase 1: JMeter Test Plan Cleaner.
+
+Do not implement parameterization, correlation, the large XML recording parser, or the full review GUI at this stage.
+
+First, inspect the supplied JMeter ".jmx" file if available.
+
+Determine how HTTP samplers and Transaction Controllers are represented.
+
+Then implement a minimal working Python cleaner that:
+
+1. Reads a JMeter test plan.
+2. Identifies candidate unnecessary HTTP samplers.
+3. Generates a dry-run report with reasons and confidence levels.
+4. Allows the user to approve or reject individual proposed changes.
+5. Disables only approved samplers.
+6. Preserves the original JMX.
+7. Generates a separate valid modified JMX.
+
+If no JMX file has been supplied, build the initial implementation using small synthetic test plans and make the parser extensible.
+
+Do not start the next development phase until the user explicitly requests it.
+
+The most important requirement is that each phase adds new functionality without breaking or unnecessarily modifying the functionality that has already been built and approved.
