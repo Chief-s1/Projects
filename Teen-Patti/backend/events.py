@@ -1,0 +1,9 @@
+EVENTS = {
+    'PLAYER_JOINED','PLAYER_LEFT','MATCH_STARTED','CARDS_DEALT','TURN_CHANGED',
+    'CARDS_REVEALED','BID_PLACED','PLAYER_PACKED','SIDE_SHOW_REQUEST',
+    'SIDE_SHOW_ACCEPTED','SIDE_SHOW_DECLINED','SIDE_SHOW_RESOLVED','SHOW_RESOLVED','MATCH_FINISHED',
+    'MATCH_RESET','TIMEOUT','ERROR','STATE_SYNC'
+}
+
+def event(type_, version, **payload):
+    return {'type': type_, 'version': version, **payload}
