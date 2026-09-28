@@ -390,7 +390,7 @@ http://<host-ip>:8000/health
 ## Installation — Linux
 
 ```bash
-git clone <your-repository-url>
+git clone Chief-s1/Projects/tree/main/Teen-Patti
 cd teen_patti
 
 python3 -m venv .venv
